@@ -1,4 +1,6 @@
 ﻿using dotenv.net;
+using klai.Notion;
+using klai.Telegram;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -34,6 +36,13 @@ class Program
                 apiKey: apiKey,
                 serviceId: "advanced"          // Tag for dynamic retrieval
             );
+
+
+        // 1. Register as a Singleton so other classes can read the 'CurrentState' property
+        builder.Services.AddSingleton<NotionSyncWorker>();
+
+        // 2. Register that exact Singleton as a Hosted Service so its background loop runs
+        builder.Services.AddHostedService(sp => sp.GetRequiredService<NotionSyncWorker>());
 
         // Register your Telegram Worker
         builder.Services.AddHostedService<TelegramBotWorker>();

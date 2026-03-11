@@ -422,8 +422,8 @@ FodyWeavers.xsd
 *.db
 *.db-shm
 *.db-wal
-/data/
-/qdrant_storage/
+src/klai/data/
+src/klai/qdrant_storage/
 
 # OS Generated Files
 .DS_Store

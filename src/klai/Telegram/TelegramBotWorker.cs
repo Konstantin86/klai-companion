@@ -5,18 +5,21 @@ using Telegram.Bot;
 using Telegram.Bot.Polling;
 using Telegram.Bot.Types;
 using Telegram.Bot.Types.Enums;
+using klai.Notion;
 
-namespace klai;
+namespace klai.Telegram;
 
 public class TelegramBotWorker : BackgroundService
 {
     private readonly ITelegramBotClient _botClient;
     private readonly ILogger<TelegramBotWorker> _logger;
+    private readonly NotionSyncWorker _notionCache;
     private readonly long _allowedGroupId;
 
-    public TelegramBotWorker(IConfiguration configuration, ILogger<TelegramBotWorker> logger)
+    public TelegramBotWorker(IConfiguration configuration, ILogger<TelegramBotWorker> logger, NotionSyncWorker notionCache)
     {
         _logger = logger;
+        _notionCache = notionCache;
         
         // Grab the token from your .env file
         var token = configuration["TELEGRAM_BOT_TOKEN"] 

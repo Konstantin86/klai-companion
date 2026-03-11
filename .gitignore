@@ -416,3 +416,15 @@ FodyWeavers.xsd
 *.msix
 *.msm
 *.msp
+
+# Local AI Memory (Crucial to ignore!)
+# Prevents committing your SQLite chat history and vector storage volumes
+*.db
+*.db-shm
+*.db-wal
+/data/
+/qdrant_storage/
+
+# OS Generated Files
+.DS_Store
+Thumbs.db

@@ -8,6 +8,12 @@ using Telegram.Bot.Types.Enums;
 using klai.Notion;
 using Microsoft.SemanticKernel;
 using Microsoft.SemanticKernel.ChatCompletion;
+using Microsoft.Extensions.DependencyInjection;
+using klai.Chat.Model;
+using klai.Data;
+using klai.LLM;
+using Microsoft.SemanticKernel.Connectors.OpenAI;
+using Microsoft.EntityFrameworkCore;
 
 namespace klai.Telegram;
 
@@ -18,20 +24,23 @@ public class TelegramBotWorker : BackgroundService
     private readonly NotionSyncWorker _notionCache;
     private readonly Kernel _kernel;
     private readonly IConfiguration _config;
+    private readonly IServiceScopeFactory _scopeFactory;
+    private readonly TokenManagementService _tokenManager;
     private readonly long _allowedGroupId;
 
 
 
-    public TelegramBotWorker(IConfiguration configuration, ILogger<TelegramBotWorker> logger, NotionSyncWorker notionCache, Kernel kernel)
+    public TelegramBotWorker(IConfiguration configuration, ILogger<TelegramBotWorker> logger, NotionSyncWorker notionCache, Kernel kernel, IServiceScopeFactory scopeFactory, TokenManagementService tokenManager)
     {
         _logger = logger;
         _notionCache = notionCache;
         _kernel = kernel;
         _config = configuration;
+        _scopeFactory = scopeFactory;
+        _tokenManager = tokenManager;
 
         // Grab the token from your .env file
-        var token = configuration["TELEGRAM_BOT_TOKEN"]
-            ?? throw new ArgumentNullException("TELEGRAM_BOT_TOKEN is missing.");
+        var token = configuration["TELEGRAM_BOT_TOKEN"] ?? throw new ArgumentNullException("TELEGRAM_BOT_TOKEN is missing.");
 
         _botClient = new TelegramBotClient(token);
 
@@ -60,8 +69,9 @@ public class TelegramBotWorker : BackgroundService
         int? topicId = message.MessageThreadId;
         _logger.LogInformation("Received: '{Text}' | Topic ID: {Topic}", messageText, topicId?.ToString() ?? "General");
 
-        // UX Polish: Show "typing..." indicator in Telegram while the AI thinks
         await botClient.SendChatAction(message.Chat.Id, ChatAction.Typing, messageThreadId: topicId, cancellationToken: cancellationToken);
+
+        await SaveMessageAsync(topicId, "User", messageText);
 
         string responseText;
 
@@ -69,14 +79,14 @@ public class TelegramBotWorker : BackgroundService
         {
             if (topicId == null)
             {
-                // [MVP] Implement generic Q&A flow (with no topic)
                 responseText = await HandleGenericQaAsync(messageText);
             }
             else
             {
-                // [MVP] Implement happy path of goal-oriented topic flow & initial routing
                 responseText = await HandleGoalOrientedFlowAsync(messageText, topicId.Value);
             }
+
+            await SaveMessageAsync(topicId, "Assistant", responseText);
         }
         catch (Exception ex)
         {
@@ -84,14 +94,8 @@ public class TelegramBotWorker : BackgroundService
             responseText = "Sorry, I encountered an internal error while processing your request.";
         }
 
-        //        await botClient.SendMessage(chatId: message.Chat.Id, messageThreadId: topicId, text: responseText, cancellationToken: cancellationToken);
-
-        // ... (existing try/catch block where responseText is generated)
-
-        // Split the response into Telegram-safe chunks
         var messageChunks = ChunkMessage(responseText);
 
-        // Send the AI's response back to the exact topic in order
         foreach (var chunk in messageChunks)
         {
             await botClient.SendMessage(
@@ -101,12 +105,8 @@ public class TelegramBotWorker : BackgroundService
                 cancellationToken: cancellationToken
             );
 
-            // Add a tiny delay between chunks to guarantee Telegram displays them in the correct order
             await Task.Delay(100, cancellationToken);
         }
-
-
-
     }
 
     private List<string> ChunkMessage(string text, int maxLength = 4000)
@@ -114,21 +114,18 @@ public class TelegramBotWorker : BackgroundService
         var chunks = new List<string>();
         if (string.IsNullOrEmpty(text)) return chunks;
 
-        // Use 4000 instead of 4096 to leave a small buffer
         int startIndex = 0;
         while (startIndex < text.Length)
         {
             int length = Math.Min(maxLength, text.Length - startIndex);
 
-            // If we are not at the very end of the text, try to find a clean break (newline)
             if (startIndex + length < text.Length)
             {
                 int lastNewline = text.LastIndexOf('\n', startIndex + length, length);
-                if (lastNewline > startIndex) // We found a newline in this chunk!
+                if (lastNewline > startIndex)
                 {
                     length = lastNewline - startIndex;
                 }
-                // If no newline is found, it will just hard-cut at 4000 characters
             }
 
             chunks.Add(text.Substring(startIndex, length).Trim());
@@ -151,32 +148,113 @@ public class TelegramBotWorker : BackgroundService
     private async Task<string> HandleGoalOrientedFlowAsync(string messageText, int topicId)
     {
         var activeContext = _notionCache.CurrentState.GetActiveContextForTopic(topicId, _config);
-        if (activeContext == null) { return $"Unmapped Topic ID ({topicId}). Please add this ID to your `appconfig.json` under `TopicMappings` to link it to a Notion Value."; }
 
-        string systemPrompt = activeContext.SystemPrompt + $"\nToday's date is {DateTime.UtcNow:yyyy-MM-dd}.";
+        if (activeContext == null)
+        {
+            return $"Unmapped Topic ID ({topicId}). Please link it in `appconfig.json`.";
+        }
 
         var routingTriggers = _config.GetSection("AiAgentConfig:RoutingTriggers").Get<string[]>() ?? ["/plan", "/deep"];
-        bool requiresDeepReasoning = routingTriggers.Any(trigger => messageText.StartsWith(trigger, StringComparison.OrdinalIgnoreCase));
+        bool requiresDeepReasoning = routingTriggers.Any(t => messageText.StartsWith(t, StringComparison.OrdinalIgnoreCase));
 
         string serviceId = requiresDeepReasoning ? "advanced" : "fast";
-        _logger.LogInformation("Routing to Goal Flow | Context: {ValueName} | Model: {Model}", activeContext.Name, serviceId);
+        // Grab the actual model name (e.g., "gpt-4o-mini") from config to feed to the tokenizer
+        string modelName = _config[$"AiAgentConfig:Models:{(requiresDeepReasoning ? "Advanced" : "Fast")}"]!;
 
-        // Strip the trigger word (e.g., "/plan") so the LLM doesn't get confused reading it
         if (requiresDeepReasoning)
         {
             var triggerWord = routingTriggers.First(t => messageText.StartsWith(t, StringComparison.OrdinalIgnoreCase));
             messageText = messageText.Substring(triggerWord.Length).Trim();
         }
 
+        // --- 1. LOAD CONTEXT & ENFORCE TOKEN BUDGET ---
+        int maxNotionTokens = _config.GetValue<int>("AiAgentConfig:TokenBudgets:MaxNotionContext", 2000);
+
+        // Serialize WITHOUT indentation to save hundreds of formatting tokens
+        //var jsonOptions = new System.Text.Json.JsonSerializerOptions { WriteIndented = false };
+        //string rawNotionJson = System.Text.Json.JsonSerializer.Serialize(activeContext, jsonOptions);
+
+        string rawNotionText = activeContext.ToTokenOptimizedString();
+
+        // The Gatekeeper: Ensure the JSON fits in the budget
+        string safeNotionText = _tokenManager.TruncateToTokenLimit(rawNotionText, maxNotionTokens, modelName);
+
+        // Build the Master System Prompt
+        string systemPrompt = $@"{activeContext.SystemPrompt}
+Today's date is {DateTime.UtcNow:yyyy-MM-dd}.
+
+CURRENT STATE (ACTIVE GOALS & PROJECTS):
+{safeNotionText}
+
+CRITICAL INSTRUCTIONS: 
+1. Use the provided state to understand ongoing projects and deadlines. If asked about a project not in this state, assume it is archived and use your historical search tools.
+2. BE EXTREMELY CONCISE. Keep your answers to 1-3 short paragraphs maximum. Do not output long essays, lists, or full reports unless the user explicitly asks for a detailed breakdown. Get straight to the point.";
+
+        var executionSettings = new OpenAIPromptExecutionSettings
+        {
+            ToolCallBehavior = ToolCallBehavior.AutoInvokeKernelFunctions
+        };
+
         var chatCompletion = _kernel.GetRequiredService<IChatCompletionService>(serviceId);
         var chatHistory = new ChatHistory(systemPrompt);
 
-        // NOTE: In Phase 4, we will load the SQLite history and Notion JSON context here.
-        // For this baseline test, we just pass the raw message.
-        chatHistory.AddUserMessage(messageText);
+        var recentMessages = await GetRecentChatHistoryAsync(topicId, 5); // Load last 5 turns
 
-        var response = await chatCompletion.GetChatMessageContentAsync(chatHistory);
+        foreach (var msg in recentMessages)
+        {
+            if (msg.Role == "User")
+            {
+                chatHistory.AddUserMessage(msg.Content);
+            }
+            else if (msg.Role == "Assistant")
+            {
+                chatHistory.AddAssistantMessage(msg.Content);
+            }
+        }
+        chatHistory.AddUserMessage(messageText);
+        var response = await chatCompletion.GetChatMessageContentAsync(chatHistory, executionSettings, _kernel);
+
         return response.Content ?? "No response generated.";
+    }
+
+    private async Task<List<ChatMessageEntity>> GetRecentChatHistoryAsync(int topicId, int limit = 5)
+    {
+        using var scope = _scopeFactory.CreateScope();
+        var dbContext = scope.ServiceProvider.GetRequiredService<Data.KlaiDbContext>();
+
+        var messages = await dbContext.ChatMessages
+            .Where(m => m.TopicId == topicId)
+            .OrderByDescending(m => m.Timestamp) // Get newest first
+            .Take(limit)
+            .ToListAsync();
+
+        messages.Reverse();
+        return messages;
+    }
+
+    private async Task SaveMessageAsync(int? topicId, string role, string content)
+    {
+        // Create a scoped lifetime for the database transaction
+        using var scope = _scopeFactory.CreateScope();
+        var dbContext = scope.ServiceProvider.GetRequiredService<KlaiDbContext>();
+
+        if (!System.IO.Directory.Exists("data"))
+        {
+            System.IO.Directory.CreateDirectory("data");
+        }
+
+        // For the MVP: Automatically create the SQLite file/tables if they don't exist
+        await dbContext.Database.EnsureCreatedAsync();
+
+        dbContext.ChatMessages.Add(new ChatMessageEntity
+        {
+            TopicId = topicId,
+            Role = role,
+            Content = content,
+            Timestamp = DateTime.UtcNow
+        });
+
+        await dbContext.SaveChangesAsync();
     }
 
     private Task HandleErrorAsync(ITelegramBotClient botClient, Exception exception, CancellationToken cancellationToken)

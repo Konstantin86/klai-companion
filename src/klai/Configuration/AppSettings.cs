@@ -17,7 +17,9 @@ public class ModelsConfig
 
 public class TokenBudgetsConfig
 {
-    public int ChatHistoryMax { get; set; }
+    public int MaxTotalInput { get; set; } = 4000;
+    public int MaxNotionContext { get; set; } = 2000;
+    public int MaxChatHistory { get; set; } = 1000;
 }
 
 public class TimersConfig
@@ -25,3 +27,6 @@ public class TimersConfig
     // Default to 5 if someone forgets to add it to the JSON
     public int NotionSyncIntervalMinutes { get; set; } = 5; 
 }
+
+// Ensure this is added inside your AiAgentConfig class:
+// public TokenBudgetsConfig TokenBudgets { get; set; } = new();

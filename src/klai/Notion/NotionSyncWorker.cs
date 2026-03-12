@@ -31,7 +31,11 @@ public class NotionSyncWorker : BackgroundService
             try
             {
                 _logger.LogInformation("Starting Notion data sync...");
-                await BuildInMemoryGraphAsync();
+                //await BuildInMemoryGraphAsync();
+
+                //temporary code for debug purposes:
+                CurrentState = System.Text.Json.JsonSerializer.Deserialize<NotionStateCache>(await System.IO.File.ReadAllTextAsync("notion_state_debug.json"));
+
                 var intervalMinutes = _config.GetValue<int>("AiAgentConfig:Timers:NotionSyncIntervalMinutes", 5);
                 _logger.LogInformation("Notion sync complete. Next run in 5 minutes.");
 

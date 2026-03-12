@@ -1,3 +1,6 @@
+using System.Text;
+using System.Linq;
+
 namespace klai.Notion.Model;
 
 public class NotionValue
@@ -6,6 +9,49 @@ public class NotionValue
     public string Name { get; set; } = string.Empty;
     public string SystemPrompt { get; set; } = string.Empty;
     public List<NotionGoal> Goals { get; set; } = new();
+
+    public string ToTokenOptimizedString()
+{
+    var sb = new StringBuilder();
+    
+    foreach (var goal in Goals)
+    {
+        sb.AppendLine($"Goal: {goal.Name}");
+        
+        // Only append dates if they exist to save space
+        if (goal.StartDate != default) sb.AppendLine($"Start: {goal.StartDate:yyyy-MM-dd}");
+        if (goal.EndDate != default) sb.AppendLine($"End: {goal.EndDate:yyyy-MM-dd}");
+        sb.AppendLine($"Status: {goal.Status}");
+        
+        if (goal.Projects != null && goal.Projects.Any())
+        {
+            sb.AppendLine("Projects:");
+            foreach (var proj in goal.Projects)
+            {
+                sb.AppendLine($"  - {proj.Name}");
+                if (proj.Start != default) sb.AppendLine($"    Start: {proj.Start:yyyy-MM-dd}");
+                if (proj.End != default) sb.AppendLine($"    End: {proj.End:yyyy-MM-dd}");
+                sb.AppendLine($"    Status: {proj.Status}");
+                
+                if (proj.Tasks != null && proj.Tasks.Any())
+                {
+                    sb.AppendLine("    Tasks:");
+                    foreach (var task in proj.Tasks)
+                    {
+                        // Format tasks nicely: [x] for completed, [ ] for open
+                        string checkbox = task.IsCompleted ? "[x]" : "[ ]";
+                        string dateStr = task.Date.HasValue ? $" (Due: {task.Date.Value:yyyy-MM-dd})" : "";
+                        
+                        sb.AppendLine($"      {checkbox} {task.Name}{dateStr}");
+                    }
+                }
+            }
+        }
+        sb.AppendLine();
+    }
+    
+    return sb.ToString().TrimEnd();
+}
 }
 
 public class NotionGoal

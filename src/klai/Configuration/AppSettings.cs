@@ -2,6 +2,7 @@ public class AiAgentConfig
 {
     public ModelsConfig Models { get; set; } = new();
     public string[] RoutingTriggers { get; set; } = [];
+    public string KnowledgeUploadTrigger { get; set; } = string.Empty;
     public TokenBudgetsConfig TokenBudgets { get; set; } = new();
     public Dictionary<string, string> Notion { get; set; } = new();
     public Dictionary<string, string> TopicMappings { get; set; } = new();

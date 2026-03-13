@@ -12,5 +12,5 @@ public class KlaiDbContext : DbContext
 
     public DbSet<VectorizedNotionItem> VectorizedNotionItems { get; set; }
 
-    //public DbSet<KnowledgeArtifact> KnowledgeArtifacts { get; set; }
+    public DbSet<KnowledgeArtifact> KnowledgeArtifacts { get; set; }
 }

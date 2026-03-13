@@ -1,3 +1,4 @@
+
 namespace klai.Sql.Model;
 
 public class KnowledgeArtifact

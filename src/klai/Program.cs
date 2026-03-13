@@ -1,5 +1,6 @@
 ﻿using dotenv.net;
 using klai.Data;
+using klai.KnowledgeBase;
 using klai.LLM;
 using klai.LLM.RAG;
 using klai.Notion;
@@ -58,7 +59,9 @@ builder.Services.AddKernel()
                 dimensions: 3072 // Keep this!
             )
             .Plugins.AddFromType<TimePlugin>("Time")
-            .AddFromType<LongTermMemoryPlugin>("LongTermMemory");
+            .AddFromType<LongTermMemoryPlugin>("LongTermMemory")
+            .AddFromType<LocalDocumentPlugin>("LocalDocument")
+            .AddFromType<GoogleSheetsPlugin>("GoogleSheets");
 
         // Register EF Core SQLite DbContext
         var sqliteConnectionString = builder.Configuration["SQLITE_CONNECTION_STRING"]

@@ -14,6 +14,7 @@ using klai.Data;
 using klai.LLM;
 using Microsoft.SemanticKernel.Connectors.OpenAI;
 using Microsoft.EntityFrameworkCore;
+using klai.Sql.Model;
 
 namespace klai.Telegram;
 
@@ -58,7 +59,15 @@ public class TelegramBotWorker : BackgroundService
 
     private async Task HandleUpdateAsync(ITelegramBotClient botClient, Update update, CancellationToken cancellationToken)
     {
-        if (update.Message is not { Text: { } messageText } message) return;
+        //if (update.Message is not { Text: { } messageText } message) return;
+        // 1. Ensure we actually have a message object
+        if (update.Message is not { } message) return;
+
+        // 2. Safely extract the text, checking both normal text and file captions
+        string messageText = message.Text ?? message.Caption ?? string.Empty;
+
+        // 3. Ignore empty messages that don't have a document attached (like stickers or system events)
+        if (string.IsNullOrWhiteSpace(messageText) && message.Document == null) return;
 
         if (_allowedGroupId != 0 && message.Chat.Id != _allowedGroupId)
         {
@@ -83,6 +92,13 @@ public class TelegramBotWorker : BackgroundService
             }
             else
             {
+                bool wasKbUpload = await HandleKnowledgeUploadAsync(botClient, message, topicId.Value, cancellationToken);
+                if (wasKbUpload)
+                {
+                    // If it was an upload, stop processing. We don't want the LLM to try and answer a file upload.
+                    return;
+                }
+
                 responseText = await HandleGoalOrientedFlowAsync(messageText, topicId.Value);
             }
 
@@ -145,6 +161,91 @@ public class TelegramBotWorker : BackgroundService
         return response.Content ?? "No response generated.";
     }
 
+    private async Task<bool> HandleKnowledgeUploadAsync(ITelegramBotClient botClient, Message message, int topicId, CancellationToken cancellationToken)
+    {
+        var trigger = _config.GetValue<string>("KnowledgeUploadTrigger", "/kb");
+
+        // Telegram puts text in 'Caption' if a file is attached, otherwise it's in 'Text'
+        string messageText = message.Text ?? message.Caption ?? string.Empty;
+
+        if (!messageText.StartsWith(trigger, StringComparison.OrdinalIgnoreCase))
+            return false; // Not a KB upload request, let the normal LLM flow handle it
+
+        using var scope = _scopeFactory.CreateScope();
+        var dbContext = scope.ServiceProvider.GetRequiredService<Data.KlaiDbContext>();
+
+        // Strip the trigger word to isolate the user's description
+        string description = messageText.Substring(trigger.Length).Trim();
+
+        // --- SCENARIO 1: Document Upload (.docx) ---
+        if (message.Document != null)
+        {
+            if (!message.Document.FileName.EndsWith(".docx", StringComparison.OrdinalIgnoreCase))
+            {
+                await botClient.SendMessage(message.Chat.Id, "⚠️ Currently, only .docx files are supported.", messageThreadId: topicId, cancellationToken: cancellationToken);
+                return true;
+            }
+
+            // 1. Download the file from Telegram's servers
+            var fileInfo = await botClient.GetFile(message.Document.FileId, cancellationToken);
+            string saveDirectory = Path.Combine("data", "files");
+            Directory.CreateDirectory(saveDirectory); // Ensure the folder exists
+
+            // Add a short GUID to prevent filename collisions if you upload two "CV.docx" files over time
+            string uniqueFileName = $"{Guid.NewGuid().ToString().Substring(0, 8)}_{message.Document.FileName}";
+            string localFilePath = Path.Combine(saveDirectory, uniqueFileName);
+
+            using var fileStream = new FileStream(localFilePath, FileMode.Create);
+            await botClient.DownloadFile(fileInfo.FilePath, fileStream, cancellationToken);
+
+            // 2. Save the artifact record to SQLite
+            dbContext.KnowledgeArtifacts.Add(new KnowledgeArtifact
+            {
+                TopicId = topicId,
+                ArtifactType = "LocalDocument",
+                Uri = localFilePath,
+                Description = string.IsNullOrWhiteSpace(description) ? message.Document.FileName : description,
+                AddedAt = DateTime.UtcNow
+            });
+            await dbContext.SaveChangesAsync(cancellationToken);
+
+            await botClient.SendMessage(message.Chat.Id, $"✅ Saved `{message.Document.FileName}` to the Knowledge Base for this topic.", messageThreadId: topicId, parseMode: ParseMode.Markdown, cancellationToken: cancellationToken);
+            return true;
+        }
+
+        // --- SCENARIO 2: Google Spreadsheet Link ---
+        // Group 1 grabs the Base URL. Group 2 optionally grabs the GID if you pasted a link to a specific tab.
+        var sheetRegex = new System.Text.RegularExpressions.Regex(@"(https:\/\/docs\.google\.com\/spreadsheets\/d\/[a-zA-Z0-9-_]+)(?:.*?gid=(\d+))?\S*");
+        var match = sheetRegex.Match(messageText);
+
+        if (match.Success)
+        {
+            string baseUrl = match.Groups[1].Value;
+            // If the URL had a gid, grab it. Otherwise, default to "0" (the first tab).
+            string gid = match.Groups[2].Success ? match.Groups[2].Value : "0";
+            string fullUrl = match.Value;
+
+            description = description.Replace(fullUrl, "").Trim();
+
+            dbContext.KnowledgeArtifacts.Add(new KnowledgeArtifact
+            {
+                TopicId = topicId,
+                ArtifactType = "GoogleSheet",
+                Uri = $"{baseUrl}?gid={gid}", // We save it in a clean format the plugin can easily parse
+                Description = string.IsNullOrWhiteSpace(description) ? "Google Spreadsheet" : description,
+                AddedAt = DateTime.UtcNow
+            });
+            await dbContext.SaveChangesAsync(cancellationToken);
+
+            await botClient.SendMessage(message.Chat.Id, $"✅ Linked Google Sheet (Tab ID: {gid}) to the Knowledge Base.", messageThreadId: topicId, cancellationToken: cancellationToken);
+            return true;
+        }
+
+        // --- SCENARIO 3: Error / Invalid Input ---
+        await botClient.SendMessage(message.Chat.Id, "⚠️ I saw the `/kb` tag, but couldn't find a `.docx` file attachment or a valid Google Sheets link.", messageThreadId: topicId, cancellationToken: cancellationToken);
+        return true;
+    }
+
     private async Task<string> HandleGoalOrientedFlowAsync(string messageText, int topicId)
     {
         var activeContext = _notionCache.CurrentState.GetActiveContextForTopic(topicId, _config);
@@ -155,6 +256,8 @@ public class TelegramBotWorker : BackgroundService
         }
 
         var routingTriggers = _config.GetSection("AiAgentConfig:RoutingTriggers").Get<string[]>() ?? ["/plan", "/deep"];
+        var knowledgeUploadTrigger = _config.GetValue<string>("KnowledgeUploadTrigger", "/kb");
+
         bool requiresDeepReasoning = routingTriggers.Any(t => messageText.StartsWith(t, StringComparison.OrdinalIgnoreCase));
 
         string serviceId = requiresDeepReasoning ? "advanced" : "fast";
@@ -179,22 +282,58 @@ public class TelegramBotWorker : BackgroundService
         // The Gatekeeper: Ensure the JSON fits in the budget
         string safeNotionText = _tokenManager.TruncateToTokenLimit(rawNotionText, maxNotionTokens, modelName);
 
+        // --- 1.5 FETCH KNOWLEDGE BASE ARTIFACTS ---
+        using var scope = _scopeFactory.CreateScope();
+        var dbContext = scope.ServiceProvider.GetRequiredService<Data.KlaiDbContext>();
+
+        var artifacts = await dbContext.KnowledgeArtifacts
+            .Where(a => a.TopicId == topicId)
+            .OrderBy(a => a.AddedAt)
+            .ToListAsync();
+
+        var kbBuilder = new System.Text.StringBuilder();
+        if (artifacts.Any())
+        {
+            kbBuilder.AppendLine("AVAILABLE KNOWLEDGE BASE ARTIFACTS:");
+            kbBuilder.AppendLine("To read these artifacts, you MUST use the corresponding tool and pass the exact URI provided. Do not guess their contents.");
+            kbBuilder.AppendLine();
+
+            foreach (var artifact in artifacts)
+            {
+                kbBuilder.AppendLine($"[Type: {artifact.ArtifactType}] - URI: {artifact.Uri}");
+                kbBuilder.AppendLine($"Description: {artifact.Description}");
+
+                if (artifact.ArtifactType == "LocalDocument")
+                {
+                    kbBuilder.AppendLine("-> Use Tool: LocalDocument-ReadLocalDocument");
+                }
+                else if (artifact.ArtifactType == "GoogleSheet")
+                {
+                    kbBuilder.AppendLine("-> Use Tool: GoogleSheets-ReadGoogleSheet");
+                }
+                kbBuilder.AppendLine();
+            }
+        }
+        string dynamicKbContext = kbBuilder.ToString();
+
         string systemPrompt = $@"
                 {activeContext.SystemPrompt}
                 Today's date is {DateTime.UtcNow:yyyy-MM-dd}.
 
                 USER PROFILE:
-                Name: Kostya
-                Age/Physical: 35yo, 185cm, 85kg
+                My name is Kostya
+                Birthday: August 12 1986, height:175cm, weight: 83kg
                 Family: Married, 2 kids
-                Role: Delivery Manager / Solutions Architect
-                Communication Style: Direct, technical, no fluff.
+                Role: Delivery Manager with technical background (.NET, Microsoft Azure, Solutions Architecture)
+                Communication Style: Best-Friend Style, Direct, Technical, no fluff.
 
                 CURRENT STATE (ACTIVE GOALS & PROJECTS):
                 {safeNotionText}
 
+                {dynamicKbContext}
+
                 CRITICAL INSTRUCTIONS: 
-                1. BE EXTREMELY CONCISE. Keep your answers to 1-3 short paragraphs maximum. Do not output long essays, lists, or full reports unless the user explicitly asks for a detailed breakdown. Get straight to the point.
+                1. BE EXTREMELY CONCISE. Keep your answers to up 2-3 short paragraphs maximum. Do not output long essays, lists, or full reports unless the user explicitly asks for a detailed breakdown. Get straight to the point.
                 
                 RULES OF ENGAGEMENT (AVAILABLE TOOLS & MISSING DATA):
                 - PAST FACTS & NOTES: If you need a historical fact, past decision, or personal context not in the prompt, DO NOT hallucinate. Use your Long-Term Memory search tool first.

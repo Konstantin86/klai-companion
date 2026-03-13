@@ -74,4 +74,9 @@ public class NotionStateCache
 
         return leanValue;
     }
+
+    internal IEnumerable<NotionGoal> GetAllGoals()
+    {
+        return Values.SelectMany(v => v.Goals);
+    }
 }

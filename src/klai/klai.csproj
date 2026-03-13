@@ -4,6 +4,7 @@
     <OutputType>Exe</OutputType>
     <TargetFramework>net9.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
+    <NoWarn>$(NoWarn);SKEXP0010</NoWarn>
     <Nullable>enable</Nullable>
   </PropertyGroup>
 
@@ -31,6 +32,7 @@
     <PackageReference Include="Microsoft.SemanticKernel.Plugins.Core" Version="1.73.0-preview" />
     <PackageReference Include="Microsoft.SemanticKernel.Plugins.Web" Version="1.73.0-alpha" />
     <PackageReference Include="Notion.Net" Version="4.4.0" />
+    <PackageReference Include="Qdrant.Client" Version="1.17.0" />
     <PackageReference Include="Telegram.Bot" Version="22.9.5.3" />
   </ItemGroup>
 

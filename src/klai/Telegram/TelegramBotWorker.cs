@@ -179,16 +179,28 @@ public class TelegramBotWorker : BackgroundService
         // The Gatekeeper: Ensure the JSON fits in the budget
         string safeNotionText = _tokenManager.TruncateToTokenLimit(rawNotionText, maxNotionTokens, modelName);
 
-        // Build the Master System Prompt
-        string systemPrompt = $@"{activeContext.SystemPrompt}
-Today's date is {DateTime.UtcNow:yyyy-MM-dd}.
+        string systemPrompt = $@"
+                {activeContext.SystemPrompt}
+                Today's date is {DateTime.UtcNow:yyyy-MM-dd}.
 
-CURRENT STATE (ACTIVE GOALS & PROJECTS):
-{safeNotionText}
+                USER PROFILE:
+                Name: Kostya
+                Age/Physical: 35yo, 185cm, 85kg
+                Family: Married, 2 kids
+                Role: Delivery Manager / Solutions Architect
+                Communication Style: Direct, technical, no fluff.
 
-CRITICAL INSTRUCTIONS: 
-1. Use the provided state to understand ongoing projects and deadlines. If asked about a project not in this state, assume it is archived and use your historical search tools.
-2. BE EXTREMELY CONCISE. Keep your answers to 1-3 short paragraphs maximum. Do not output long essays, lists, or full reports unless the user explicitly asks for a detailed breakdown. Get straight to the point.";
+                CURRENT STATE (ACTIVE GOALS & PROJECTS):
+                {safeNotionText}
+
+                CRITICAL INSTRUCTIONS: 
+                1. BE EXTREMELY CONCISE. Keep your answers to 1-3 short paragraphs maximum. Do not output long essays, lists, or full reports unless the user explicitly asks for a detailed breakdown. Get straight to the point.
+                
+                RULES OF ENGAGEMENT (AVAILABLE TOOLS & MISSING DATA):
+                - PAST FACTS & NOTES: If you need a historical fact, past decision, or personal context not in the prompt, DO NOT hallucinate. Use your Long-Term Memory search tool first.
+                - PROACTIVE INQUIRY: If you still lack critical numerical data (like salaries, budgets, or specific metrics) after searching your memory, STOP and ask me for it. Do not use placeholder assumptions to finish a task.
+                - MY CAREER: If I ask about my resume, skills, or job history, pull my CV.
+                - PROJECT TRACKING: If I ask about specific risks, milestones, or tabular data not in the active state, load the Project Spreadsheet.";
 
         var executionSettings = new OpenAIPromptExecutionSettings
         {

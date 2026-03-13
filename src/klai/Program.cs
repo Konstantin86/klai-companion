@@ -1,7 +1,9 @@
 ﻿using dotenv.net;
 using klai.Data;
 using klai.LLM;
+using klai.LLM.RAG;
 using klai.Notion;
+using klai.RAG;
 using klai.Telegram;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
@@ -9,6 +11,7 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.SemanticKernel;
 using Microsoft.SemanticKernel.Plugins.Core;
+using Qdrant.Client;
 
 namespace klai;
 
@@ -27,20 +30,35 @@ class Program
         var fastModel = builder.Configuration["AiAgentConfig:Models:Fast"]!;
         var advancedModel = builder.Configuration["AiAgentConfig:Models:Advanced"]!;
 
-        builder.Services.AddKernel()
+        var embeddingModel = builder.Configuration["EMBEDDING_MODEL"] ?? "text-embedding-3-large";
+        var qdrantEndpoint = builder.Configuration["QDRANT_ENDPOINT"] ?? "http://localhost:6333";
+        var qdrantHost = builder.Configuration["QDRANT_HOST"] ?? "localhost";
+        builder.Services.AddSingleton(sp => new QdrantClient(qdrantHost, 6334));
+
+        //builder.Services.AddSingleton(sp => new QdrantClient(qdrantEndpoint));
+builder.Services.AddKernel()
             .AddAzureOpenAIChatCompletion(
-                deploymentName: fastModel,     // e.g., "gpt-5-mini"
+                deploymentName: fastModel,     
                 endpoint: endpoint,
                 apiKey: apiKey,
-                serviceId: "fast"              // Tag for dynamic retrieval
+                serviceId: "fast"              
             )
             .AddAzureOpenAIChatCompletion(
-                deploymentName: advancedModel, // e.g., "o4-mini"
+                deploymentName: advancedModel, 
                 endpoint: endpoint,
                 apiKey: apiKey,
-                serviceId: "advanced"          // Tag for dynamic retrieval
+                serviceId: "advanced"          
             )
-            .Plugins.AddFromType<TimePlugin>("Time");
+            // --- REVERT BACK TO THE OLD METHOD ---
+            .AddAzureOpenAITextEmbeddingGeneration(
+                deploymentName: embeddingModel,
+                endpoint: endpoint,
+                apiKey: apiKey,
+                serviceId: "embedding",
+                dimensions: 3072 // Keep this!
+            )
+            .Plugins.AddFromType<TimePlugin>("Time")
+            .AddFromType<LongTermMemoryPlugin>("LongTermMemory");
 
         // Register EF Core SQLite DbContext
         var sqliteConnectionString = builder.Configuration["SQLITE_CONNECTION_STRING"]
@@ -59,6 +77,8 @@ class Program
 
         // Register your Telegram Worker
         builder.Services.AddHostedService<TelegramBotWorker>();
+
+        builder.Services.AddHostedService<MemoryConsolidationWorker>();
 
         var host = builder.Build();
         host.Run();

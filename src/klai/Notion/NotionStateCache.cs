@@ -8,6 +8,7 @@ public class NotionStateCache
     public DateTime LastSyncedAt { get; set; }
     public List<NotionValue> Values { get; set; } = new();
     public List<NotionNote> Notes { get; set; } = new();
+    public List<NotionTask> FloatingTasks { get; set; } = new();
     
     // Helper method for the webhook to find context instantly
     public NotionValue? GetValueByTopicId(int topicId, IConfiguration config)
@@ -16,7 +17,7 @@ public class NotionStateCache
         return Values.FirstOrDefault(v => v.Name == valueName);
     }
 
-    public NotionValue? GetActiveContextForTopic(int topicId, IConfiguration config)
+    public NotionActiveContext? GetActiveContextForTopic(int topicId, IConfiguration config)
     {
         // 1. Map the Telegram Topic ID to the Notion Value Name
         var valueName = config[$"AiAgentConfig:TopicMappings:{topicId}"];
@@ -72,7 +73,17 @@ public class NotionStateCache
             leanValue.Goals.Add(leanGoal);
         }
 
-        return leanValue;
+        var notionActiveContext = new NotionActiveContext
+        {
+            Value = leanValue,
+            FloatingTasks = FloatingTasks.Where(t => // Filter Tasks: Only open tasks, or tasks completed in the last 7 days
+                    (t.Date.HasValue &&
+                    (!t.IsCompleted || 
+                    (t.IsCompleted && t.Date >= oneWeekAgo)))
+                ).ToList()
+        };
+
+        return notionActiveContext;
     }
 
     internal IEnumerable<NotionGoal> GetAllGoals()

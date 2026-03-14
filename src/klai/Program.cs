@@ -7,11 +7,13 @@ using klai.Notion;
 using klai.RAG;
 using klai.Telegram;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.SemanticKernel;
 using Microsoft.SemanticKernel.Plugins.Core;
+using Notion.Client;
 using Qdrant.Client;
 
 namespace klai;
@@ -36,32 +38,40 @@ class Program
         var qdrantHost = builder.Configuration["QDRANT_HOST"] ?? "localhost";
         builder.Services.AddSingleton(sp => new QdrantClient(qdrantHost, 6334));
 
-        //builder.Services.AddSingleton(sp => new QdrantClient(qdrantEndpoint));
-builder.Services.AddKernel()
-            .AddAzureOpenAIChatCompletion(
-                deploymentName: fastModel,     
-                endpoint: endpoint,
-                apiKey: apiKey,
-                serviceId: "fast"              
-            )
-            .AddAzureOpenAIChatCompletion(
-                deploymentName: advancedModel, 
-                endpoint: endpoint,
-                apiKey: apiKey,
-                serviceId: "advanced"          
-            )
-            // --- REVERT BACK TO THE OLD METHOD ---
-            .AddAzureOpenAITextEmbeddingGeneration(
-                deploymentName: embeddingModel,
-                endpoint: endpoint,
-                apiKey: apiKey,
-                serviceId: "embedding",
-                dimensions: 3072 // Keep this!
-            )
-            .Plugins.AddFromType<TimePlugin>("Time")
-            .AddFromType<LongTermMemoryPlugin>("LongTermMemory")
-            .AddFromType<LocalDocumentPlugin>("LocalDocument")
-            .AddFromType<GoogleSheetsPlugin>("GoogleSheets");
+        // --- NEW: Register the Notion Client into DI so the Plugin can use it ---
+        builder.Services.AddSingleton<INotionClient>(sp =>
+        {
+            var config = sp.GetRequiredService<IConfiguration>();
+            var secret = config["NOTION_SECRET"] ?? throw new ArgumentNullException("NOTION_SECRET is missing");
+            return NotionClientFactory.Create(new ClientOptions { AuthToken = secret });
+        });
+
+        builder.Services.AddKernel()
+                    .AddAzureOpenAIChatCompletion(
+                        deploymentName: fastModel,
+                        endpoint: endpoint,
+                        apiKey: apiKey,
+                        serviceId: "fast"
+                    )
+                    .AddAzureOpenAIChatCompletion(
+                        deploymentName: advancedModel,
+                        endpoint: endpoint,
+                        apiKey: apiKey,
+                        serviceId: "advanced"
+                    )
+                    // --- REVERT BACK TO THE OLD METHOD ---
+                    .AddAzureOpenAITextEmbeddingGeneration(
+                        deploymentName: embeddingModel,
+                        endpoint: endpoint,
+                        apiKey: apiKey,
+                        serviceId: "embedding",
+                        dimensions: 3072 // Keep this!
+                    )
+                    .Plugins.AddFromType<TimePlugin>("Time")
+                    .AddFromType<LongTermMemoryPlugin>("LongTermMemory")
+                    .AddFromType<LocalDocumentPlugin>("LocalDocument")
+                    .AddFromType<GoogleSheetsPlugin>("GoogleSheets")
+                    .AddFromType<NotionPlannerPlugin>("NotionPlanner");
 
         // Register EF Core SQLite DbContext
         var sqliteConnectionString = builder.Configuration["SQLITE_CONNECTION_STRING"]

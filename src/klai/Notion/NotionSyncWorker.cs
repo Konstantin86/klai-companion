@@ -138,6 +138,20 @@ public class NotionSyncWorker : BackgroundService
             newState.Values.Add(valueNode);
         }
 
+        // Find Tasks linked to this Project
+        var floatingTaskPages = rawTasks.Where(t => GetRelationIds(t, "Projects").Count == 0);
+
+        foreach (var tPage in floatingTaskPages)
+        {
+            newState.FloatingTasks.Add(new NotionTask
+            {
+                Id = tPage.Id,
+                Name = GetTitle(tPage, "Name"),
+                IsCompleted = GetCheckbox(tPage, "Completed"),
+                Date = GetDate(tPage, "Date")
+            });
+        }
+
         foreach (var notePage in rawNotes)
         {
             var type = GetSelect(notePage, "Type");

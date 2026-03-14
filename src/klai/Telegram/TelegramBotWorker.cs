@@ -317,7 +317,7 @@ public class TelegramBotWorker : BackgroundService
         string dynamicKbContext = kbBuilder.ToString();
 
         string systemPrompt = $@"
-                {activeContext.SystemPrompt}
+                {activeContext.Value.SystemPrompt}
                 Today's date is {DateTime.UtcNow:yyyy-MM-dd}.
 
                 USER PROFILE:
@@ -340,6 +340,22 @@ public class TelegramBotWorker : BackgroundService
                 - PROACTIVE INQUIRY: If you still lack critical numerical data (like salaries, budgets, or specific metrics) after searching your memory, STOP and ask me for it. Do not use placeholder assumptions to finish a task.
                 - MY CAREER: If I ask about my resume, skills, or job history, pull my CV.
                 - PROJECT TRACKING: If I ask about specific risks, milestones, or tabular data not in the active state, load the Project Spreadsheet.";
+
+        // --- TEMPORARY DEBUG DUMP ---
+        try
+        {
+            // Normalize any mixed line endings to your OS standard so it formats perfectly in VS Code / Notepad
+            string formattedPrompt = systemPrompt.Replace("\r\n", "\n").Replace("\n", Environment.NewLine);
+
+            // Write it to the root directory of your app
+            await System.IO.File.WriteAllTextAsync("debug_system_prompt.txt", formattedPrompt);
+        }
+        catch (Exception ex)
+        {
+            // Silently swallow the error so a file-lock doesn't crash your bot
+            Console.WriteLine($"Could not write debug prompt: {ex.Message}");
+        }
+        // ----------------------------
 
         var executionSettings = new OpenAIPromptExecutionSettings
         {

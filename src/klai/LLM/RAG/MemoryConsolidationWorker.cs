@@ -302,6 +302,18 @@ public class MemoryConsolidationWorker : BackgroundService
             }
         }
 
+        foreach (var task in notionCache.FloatingTasks)
+        {
+            if (task.IsCompleted && !processedIds.Contains(task.Id))
+            {
+                string taskDate = task.Date.HasValue 
+                    ? $"\nDue Date: {task.Date.Value:yyyy-MM-dd}" 
+                    : "";
+                    
+                itemsToProcess.Add((task.Id, "FloatingTask", $"Completed Task: {task.Name}{taskDate}\nCompleted On: {DateTime.UtcNow:yyyy-MM-dd}"));
+            }
+        }
+
         if (!itemsToProcess.Any()) return;
 
         _logger.LogInformation($"Found {itemsToProcess.Count} new closed Notion items to vectorize.");

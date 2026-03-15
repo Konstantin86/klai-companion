@@ -31,10 +31,14 @@ public class NotionSyncWorker : BackgroundService
             try
             {
                 _logger.LogInformation("Starting Notion data sync...");
-                //await BuildInMemoryGraphAsync();
+                // Read the fresh value on every loop iteration!
+                var lookbackMonths = _config.GetValue<int>("AiAgentConfig:Notion:TaskLookbackMonths", -2);
+                var cutoffDate = DateTime.UtcNow.AddMonths(lookbackMonths);
+
+                await BuildInMemoryGraphAsync(cutoffDate);
 
                 //temporary code for debug purposes:
-                CurrentState = System.Text.Json.JsonSerializer.Deserialize<NotionStateCache>(await System.IO.File.ReadAllTextAsync("notion_state_debug.json"));
+                //CurrentState = System.Text.Json.JsonSerializer.Deserialize<NotionStateCache>(await System.IO.File.ReadAllTextAsync("notion_state_debug.json"));
 
                 var intervalMinutes = _config.GetValue<int>("AiAgentConfig:Timers:NotionSyncIntervalMinutes", 5);
                 _logger.LogInformation("Notion sync complete. Next run in 5 minutes.");
@@ -49,7 +53,7 @@ public class NotionSyncWorker : BackgroundService
         }
     }
 
-    private async Task BuildInMemoryGraphAsync()
+    private async Task BuildInMemoryGraphAsync(DateTime cutoffDate)
     {
         var valuesDbId = _config["AiAgentConfig:Notion:ValuesDbId"];
         var goalsDbId = _config["AiAgentConfig:Notion:GoalsDbId"];
@@ -57,15 +61,13 @@ public class NotionSyncWorker : BackgroundService
         var tasksDbId = _config["AiAgentConfig:Notion:TasksDbId"];
         var notesDbId = _config["AiAgentConfig:Notion:NotesDbId"];
 
-        // 1. Fetch all non-archived rows concurrently to save time
         var valuesTask = FetchAllPagesAsync(valuesDbId, "Archive");
         var goalsTask = FetchAllPagesAsync(goalsDbId, "Archived");
         var projectsTask = FetchAllPagesAsync(projectsDbId, "Archive");
-        var tasksTask = FetchAllPagesAsync(tasksDbId, null); // Tasks might just rely on 'Completed' instead of archive
+        var tasksTask = FetchAllPagesAsync(tasksDbId, null, cutoffDate);
         var notesTask = FetchAllPagesAsync(notesDbId, "Archived");
 
         await Task.WhenAll(valuesTask, goalsTask, projectsTask, tasksTask, notesTask);
-        //await Task.WhenAll(tasksTask);
 
         var rawValues = valuesTask.Result;
         var rawGoals = goalsTask.Result;
@@ -201,7 +203,7 @@ public class NotionSyncWorker : BackgroundService
 
     // --- Helper Methods to safely parse Notion API Properties ---
 
-    private async Task<List<Page>> FetchAllPagesAsync(string? databaseId, string? archiveColumnName)
+    private async Task<List<Page>> FetchAllPagesAsync(string? databaseId, string? archiveColumnName, DateTime? modifiedAfter = null)
     {
         if (string.IsNullOrEmpty(databaseId)) return new List<Page>();
 
@@ -209,11 +211,28 @@ public class NotionSyncWorker : BackgroundService
         string? cursor = null;
 
         var queryParams = new DatabasesQueryParameters();
+        var filterList = new List<Filter>();
 
-        // Example of applying a Notion filter if you have an explicit Archive checkbox
         if (!string.IsNullOrEmpty(archiveColumnName))
         {
-            queryParams.Filter = new CheckboxFilter(archiveColumnName, equal: false);
+            filterList.Add(new CheckboxFilter(archiveColumnName, equal: false));
+        }
+
+        if (modifiedAfter.HasValue)
+        {
+            filterList.Add(new TimestampLastEditedTimeFilter
+            {
+                LastEditedTime = new DateFilter.Condition { OnOrAfter = modifiedAfter.Value }
+            });
+        }
+
+        if (filterList.Count > 1)
+        {
+            queryParams.Filter = new CompoundFilter { And = filterList };
+        }
+        else if (filterList.Count == 1)
+        {
+            queryParams.Filter = filterList.First();
         }
 
         try

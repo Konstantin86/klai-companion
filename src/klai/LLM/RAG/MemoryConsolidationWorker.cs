@@ -11,6 +11,7 @@ using System.Text;
 using klai.Notion;
 using klai.Sql.Model;
 using klai.Notion.Model;
+using Microsoft.Extensions.Configuration;
 
 namespace klai.RAG;
 
@@ -18,12 +19,14 @@ public class MemoryConsolidationWorker : BackgroundService
 {
     private readonly IServiceProvider _serviceProvider;
     private readonly ILogger<MemoryConsolidationWorker> _logger;
+    private readonly IConfiguration _config;
     private readonly string _collectionName = "klai_long_term_memory";
 
-    public MemoryConsolidationWorker(IServiceProvider serviceProvider, ILogger<MemoryConsolidationWorker> logger)
+    public MemoryConsolidationWorker(IServiceProvider serviceProvider, ILogger<MemoryConsolidationWorker> logger, IConfiguration config)
     {
         _serviceProvider = serviceProvider;
         _logger = logger;
+        _config = config;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -74,6 +77,17 @@ public class MemoryConsolidationWorker : BackgroundService
             }
 
             // For dev/testing, you might want to change this to TimeSpan.FromMinutes(5)
+
+
+            // 2. Read the interval from config dynamically (Defaults to 1440 mins / 24 hours if missing)
+            var intervalMinutes = _config.GetValue<int>("AiAgentConfig:RAG:ConsolidationIntervalMinutes", 1440);
+
+            _logger.LogInformation("Consolidation cycle complete. Sleeping for {Interval} minutes...", intervalMinutes);
+
+            // 3. Sleep for the configured duration
+            await Task.Delay(TimeSpan.FromMinutes(intervalMinutes), stoppingToken);
+
+
             await Task.Delay(TimeSpan.FromHours(24), stoppingToken);
         }
     }

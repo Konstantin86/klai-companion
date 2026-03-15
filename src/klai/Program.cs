@@ -94,6 +94,16 @@ class Program
         builder.Services.AddHostedService<MemoryConsolidationWorker>();
 
         var host = builder.Build();
+
+        using (var scope = host.Services.CreateScope())
+        {
+            var dbContext = scope.ServiceProvider.GetRequiredService<klai.Data.KlaiDbContext>(); // Update namespace if yours is different
+
+            // This safely creates the database and all tables if they don't exist. 
+            // It does nothing if they are already there.
+            dbContext.Database.EnsureCreated();
+        }
+
         host.Run();
 
     }

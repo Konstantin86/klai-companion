@@ -30,8 +30,33 @@ public class MemoryConsolidationWorker : BackgroundService
     {
         _logger.LogInformation("Memory Consolidation Worker started.");
 
+
+        bool qdrantReady = false;
+        while (!qdrantReady && !stoppingToken.IsCancellationRequested)
+        {
+            try
+            {
+                await EnsureCollectionExistsAsync();
+                qdrantReady = true;
+                _logger.LogInformation("✅ Successfully connected to Qdrant!");
+            }
+            catch (Grpc.Core.RpcException ex) when (ex.StatusCode == Grpc.Core.StatusCode.Unavailable)
+            {
+                _logger.LogWarning("⏳ Qdrant is still initializing. Retrying in 5 seconds...");
+                await Task.Delay(TimeSpan.FromSeconds(5), stoppingToken);
+            }
+            catch (Exception ex) // Catch any other unexpected Qdrant startup errors
+            {
+                _logger.LogError(ex, "Unexpected error connecting to Qdrant. Retrying...");
+                await Task.Delay(TimeSpan.FromSeconds(5), stoppingToken);
+            }
+        }
+
+
+
+
         // Create the Qdrant collection if it doesn't exist yet
-        await EnsureCollectionExistsAsync();
+        //await EnsureCollectionExistsAsync();
 
         while (!stoppingToken.IsCancellationRequested)
         {
@@ -96,7 +121,7 @@ public class MemoryConsolidationWorker : BackgroundService
             for (int i = 0; i < chunks.Count; i++)
             {
                 string chunkContent = chunks[i];
-                
+
                 // Prepend the title and date to EVERY chunk so the AI always has context 
                 // even if it only retrieves chunk #3 of a long note.
                 string formattedContent = $"Note Title: {note.Name}\nLast Edited: {note.LastEditedTime:yyyy-MM-dd}\n\n{chunkContent}";
@@ -144,9 +169,9 @@ public class MemoryConsolidationWorker : BackgroundService
         var chunks = new List<string>();
         // Split cleanly by the \n characters found in your JSON
         var paragraphs = text.Split(new[] { "\n\n", "\r\n\r\n", "\n" }, StringSplitOptions.RemoveEmptyEntries);
-        
+
         var currentChunk = new StringBuilder();
-        
+
         foreach (var p in paragraphs)
         {
             // If adding this paragraph pushes us over the limit, save current chunk and start a new one
@@ -157,13 +182,13 @@ public class MemoryConsolidationWorker : BackgroundService
             }
             currentChunk.AppendLine(p.Trim());
         }
-        
+
         // Add whatever is left over
         if (currentChunk.Length > 0)
         {
             chunks.Add(currentChunk.ToString().Trim());
         }
-        
+
         return chunks;
     }
 
@@ -247,7 +272,7 @@ public class MemoryConsolidationWorker : BackgroundService
         // Assuming you registered your Notion cache as a Singleton
         // Ask for the worker we actually registered
         var notionSyncWorker = scope.ServiceProvider.GetRequiredService<NotionSyncWorker>();
-        
+
         // Grab the cache from its public property, just like the Telegram bot does!
         var notionCache = notionSyncWorker.CurrentState;
 
@@ -277,10 +302,10 @@ public class MemoryConsolidationWorker : BackgroundService
                 if (closedStatuses.Contains(proj.Status) && !processedIds.Contains(proj.Id))
                 {
                     // Safely format project dates
-                    string projDates = (proj.Start != default || proj.End != default) 
-                        ? $"\nStart: {proj.Start:yyyy-MM-dd}\nEnd: {proj.End:yyyy-MM-dd}" 
+                    string projDates = (proj.Start != default || proj.End != default)
+                        ? $"\nStart: {proj.Start:yyyy-MM-dd}\nEnd: {proj.End:yyyy-MM-dd}"
                         : "";
-                        
+
                     itemsToProcess.Add((proj.Id, "Project", $"Archived Project: {proj.Name}\nParent Goal: {goal.Name}\nStatus: {proj.Status}{projDates}"));
                 }
 
@@ -292,10 +317,10 @@ public class MemoryConsolidationWorker : BackgroundService
                     if (task.IsCompleted && !processedIds.Contains(task.Id))
                     {
                         // Safely format task target date (assuming it's a nullable DateTime?)
-                        string taskDate = task.Date.HasValue 
-                            ? $"\nDue Date: {task.Date.Value:yyyy-MM-dd}" 
+                        string taskDate = task.Date.HasValue
+                            ? $"\nDue Date: {task.Date.Value:yyyy-MM-dd}"
                             : "";
-                            
+
                         itemsToProcess.Add((task.Id, "Task", $"Completed Task: {task.Name}\nParent Project: {proj.Name}{taskDate}\nCompleted On: {DateTime.UtcNow:yyyy-MM-dd}"));
                     }
                 }
@@ -306,10 +331,10 @@ public class MemoryConsolidationWorker : BackgroundService
         {
             if (task.IsCompleted && !processedIds.Contains(task.Id))
             {
-                string taskDate = task.Date.HasValue 
-                    ? $"\nDue Date: {task.Date.Value:yyyy-MM-dd}" 
+                string taskDate = task.Date.HasValue
+                    ? $"\nDue Date: {task.Date.Value:yyyy-MM-dd}"
                     : "";
-                    
+
                 itemsToProcess.Add((task.Id, "FloatingTask", $"Completed Task: {task.Name}{taskDate}\nCompleted On: {DateTime.UtcNow:yyyy-MM-dd}"));
             }
         }

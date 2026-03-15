@@ -86,9 +86,6 @@ public class MemoryConsolidationWorker : BackgroundService
 
             // 3. Sleep for the configured duration
             await Task.Delay(TimeSpan.FromMinutes(intervalMinutes), stoppingToken);
-
-
-            await Task.Delay(TimeSpan.FromHours(24), stoppingToken);
         }
     }
 

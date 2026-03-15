@@ -59,14 +59,13 @@ public class TelegramBotWorker : BackgroundService
 
     private async Task HandleUpdateAsync(ITelegramBotClient botClient, Update update, CancellationToken cancellationToken)
     {
-        //if (update.Message is not { Text: { } messageText } message) return;
         // 1. Ensure we actually have a message object
         if (update.Message is not { } message) return;
 
         // 2. Safely extract the text, checking both normal text and file captions
         string messageText = message.Text ?? message.Caption ?? string.Empty;
 
-        // 3. Ignore empty messages that don't have a document attached (like stickers or system events)
+        // 3. Ignore empty messages that don't have a document attached
         if (string.IsNullOrWhiteSpace(messageText) && message.Document == null) return;
 
         if (_allowedGroupId != 0 && message.Chat.Id != _allowedGroupId)
@@ -75,11 +74,29 @@ public class TelegramBotWorker : BackgroundService
             return;
         }
 
+        // --- INTERCEPT /PLAN COMMAND ---
+        var planTrigger = _config.GetValue<string>("ProjectPlanTrigger", "/plan");
+        bool isPlanCommand = messageText.StartsWith(planTrigger, StringComparison.OrdinalIgnoreCase);
+
+        string finalUserPrompt = messageText;
+        if (isPlanCommand)
+        {
+            string planContent = messageText.Substring(planTrigger.Length).Trim();
+
+            // Wrap their request in a strict, unbreakable rule
+            finalUserPrompt = $@"[SYSTEM DIRECTIVE: The user invoked the project planning mode. 
+                            You MUST evaluate this request and immediately use the 'NotionPlanner-CreateProjectWithTasks' tool to build this project and its timeline in Notion. 
+                            Do not just list the steps in chat; you MUST call the tool and pass the JSON array.]
+                            
+                            User Request: {planContent}";
+        }
+
         int? topicId = message.MessageThreadId;
         _logger.LogInformation("Received: '{Text}' | Topic ID: {Topic}", messageText, topicId?.ToString() ?? "General");
 
         await botClient.SendChatAction(message.Chat.Id, ChatAction.Typing, messageThreadId: topicId, cancellationToken: cancellationToken);
 
+        // Save the RAW text to memory so we don't pollute the DB with system directives
         await SaveMessageAsync(topicId, "User", messageText);
 
         string responseText;
@@ -88,18 +105,19 @@ public class TelegramBotWorker : BackgroundService
         {
             if (topicId == null)
             {
-                responseText = await HandleGenericQaAsync(messageText);
+                // pass finalUserPrompt instead of messageText
+                responseText = await HandleGenericQaAsync(finalUserPrompt);
             }
             else
             {
                 bool wasKbUpload = await HandleKnowledgeUploadAsync(botClient, message, topicId.Value, cancellationToken);
                 if (wasKbUpload)
                 {
-                    // If it was an upload, stop processing. We don't want the LLM to try and answer a file upload.
                     return;
                 }
 
-                responseText = await HandleGoalOrientedFlowAsync(messageText, topicId.Value);
+                // pass finalUserPrompt instead of messageText
+                responseText = await HandleGoalOrientedFlowAsync(finalUserPrompt, topicId.Value);
             }
 
             await SaveMessageAsync(topicId, "Assistant", responseText);
@@ -365,7 +383,7 @@ public class TelegramBotWorker : BackgroundService
         var chatCompletion = _kernel.GetRequiredService<IChatCompletionService>(serviceId);
         var chatHistory = new ChatHistory(systemPrompt);
 
-        var recentMessages = await GetRecentChatHistoryAsync(topicId, 5); // Load last 5 turns
+        var recentMessages = await GetRecentChatHistoryAsync(topicId, 10);
 
         foreach (var msg in recentMessages)
         {
@@ -384,7 +402,7 @@ public class TelegramBotWorker : BackgroundService
         return response.Content ?? "No response generated.";
     }
 
-    private async Task<List<ChatMessageEntity>> GetRecentChatHistoryAsync(int topicId, int limit = 5)
+    private async Task<List<ChatMessageEntity>> GetRecentChatHistoryAsync(int topicId, int limit = 10)
     {
         using var scope = _scopeFactory.CreateScope();
         var dbContext = scope.ServiceProvider.GetRequiredService<Data.KlaiDbContext>();

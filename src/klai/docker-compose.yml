@@ -21,6 +21,7 @@ services:
       - .env
     volumes:
       - ./data:/app/data
+      - ./appsettings.json:/app/appsettings.json
     environment:
       # Override the Qdrant host to use the docker internal network
       - QDRANT_HOST=qdrant

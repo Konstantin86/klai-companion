@@ -14,12 +14,9 @@ RUN dotnet publish "klai.csproj" -c Release -o /app/publish /p:UseAppHost=false
 FROM mcr.microsoft.com/dotnet/runtime:9.0 AS final
 WORKDIR /app
 
-# Optional: Add a non-root user for security
-RUN adduser --disabled-password \
-  --home /app \
-  --gecos '' appuser && chown -R appuser /app
-USER appuser
-
 COPY --from=build /app/publish .
+
+# Create the data directory for SQLite so volume mapping doesn't fail
+RUN mkdir -p /app/data
 
 ENTRYPOINT ["dotnet", "klai.dll"]

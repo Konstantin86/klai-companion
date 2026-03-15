@@ -10,3 +10,18 @@ services:
     volumes:
       - ./qdrant_storage:/qdrant/storage
     restart: unless-stopped
+
+  klai-bot:
+    build: .
+    container_name: klai-bot
+    restart: unless-stopped
+    depends_on:
+      - qdrant
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+    environment:
+      # Override the Qdrant host to use the docker internal network
+      - QDRANT_HOST=qdrant
+      - SQLITE_CONNECTION_STRING=Data Source=/app/data/klai_memory.db

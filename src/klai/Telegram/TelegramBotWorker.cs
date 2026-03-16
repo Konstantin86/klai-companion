@@ -195,12 +195,16 @@ public class TelegramBotWorker : BackgroundService
         // Strip the trigger word to isolate the user's description
         string description = messageText.Substring(trigger.Length).Trim();
 
-        // --- SCENARIO 1: Document Upload (.docx) ---
+        // --- SCENARIO 1: Document Upload (.docx or .pdf) ---
         if (message.Document != null)
         {
-            if (!message.Document.FileName.EndsWith(".docx", StringComparison.OrdinalIgnoreCase))
+            var fileName = message.Document.FileName ?? string.Empty;
+            bool isDocx = fileName.EndsWith(".docx", StringComparison.OrdinalIgnoreCase);
+            bool isPdf = fileName.EndsWith(".pdf", StringComparison.OrdinalIgnoreCase);
+
+            if (!isDocx && !isPdf)
             {
-                await botClient.SendMessage(message.Chat.Id, "⚠️ Currently, only .docx files are supported.", messageThreadId: topicId, cancellationToken: cancellationToken);
+                await botClient.SendMessage(message.Chat.Id, "⚠️ Currently, only .docx and .pdf files are supported.", messageThreadId: topicId, cancellationToken: cancellationToken);
                 return true;
             }
 
@@ -209,8 +213,8 @@ public class TelegramBotWorker : BackgroundService
             string saveDirectory = Path.Combine("data", "files");
             Directory.CreateDirectory(saveDirectory); // Ensure the folder exists
 
-            // Add a short GUID to prevent filename collisions if you upload two "CV.docx" files over time
-            string uniqueFileName = $"{Guid.NewGuid().ToString().Substring(0, 8)}_{message.Document.FileName}";
+            // Add a short GUID to prevent filename collisions
+            string uniqueFileName = $"{Guid.NewGuid().ToString().Substring(0, 8)}_{fileName}";
             string localFilePath = Path.Combine(saveDirectory, uniqueFileName);
 
             using var fileStream = new FileStream(localFilePath, FileMode.Create);
@@ -220,14 +224,14 @@ public class TelegramBotWorker : BackgroundService
             dbContext.KnowledgeArtifacts.Add(new KnowledgeArtifact
             {
                 TopicId = topicId,
-                ArtifactType = "LocalDocument",
+                ArtifactType = "LocalDocument", // We can keep using LocalDocument for both!
                 Uri = localFilePath,
-                Description = string.IsNullOrWhiteSpace(description) ? message.Document.FileName : description,
+                Description = string.IsNullOrWhiteSpace(description) ? fileName : description,
                 AddedAt = DateTime.UtcNow
             });
             await dbContext.SaveChangesAsync(cancellationToken);
 
-            await botClient.SendMessage(message.Chat.Id, $"✅ Saved `{message.Document.FileName}` to the Knowledge Base for this topic.", messageThreadId: topicId, parseMode: ParseMode.Markdown, cancellationToken: cancellationToken);
+            await botClient.SendMessage(message.Chat.Id, $"✅ Saved `{fileName}` to the Knowledge Base for this topic.", messageThreadId: topicId, parseMode: ParseMode.Markdown, cancellationToken: cancellationToken);
             return true;
         }
 
@@ -417,5 +421,30 @@ public class TelegramBotWorker : BackgroundService
     {
         _logger.LogError(exception, "Telegram Bot encountered an error.");
         return Task.CompletedTask;
+    }
+
+    private bool IsTextStream(Stream stream)
+    {
+        // If the stream is empty, it's technically not a binary, but there's no text either
+        if (stream.Length == 0) return false;
+
+        long originalPosition = stream.Position;
+        stream.Position = 0;
+
+        // Read up to the first 512 bytes
+        byte[] buffer = new byte[512];
+        int bytesRead = stream.Read(buffer, 0, buffer.Length);
+
+        // Reset the stream so Telegram or File streams can still use it!
+        stream.Position = originalPosition;
+
+        for (int i = 0; i < bytesRead; i++)
+        {
+            if (buffer[i] == 0x00) // A null byte is the universal sign of a binary file
+            {
+                return false;
+            }
+        }
+        return true;
     }
 }

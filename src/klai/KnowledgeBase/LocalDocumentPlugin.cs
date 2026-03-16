@@ -3,13 +3,15 @@ using System.Text;
 using DocumentFormat.OpenXml.Packaging;
 using DocumentFormat.OpenXml.Wordprocessing;
 using Microsoft.SemanticKernel;
+using UglyToad.PdfPig;
+using UglyToad.PdfPig.DocumentLayoutAnalysis.TextExtractor;
 
 namespace klai.KnowledgeBase;
 
 public class LocalDocumentPlugin
 {
     [KernelFunction("ReadLocalDocument")]
-    [Description("Reads the text content of a local Microsoft Word (.docx) file. Use this when the Knowledge Base lists a LocalDocument URI that you need to reference.")]
+    [Description("Reads the text content of a local Microsoft Word (.docx) or PDF (.pdf) file. Use this when the Knowledge Base lists a LocalDocument URI that you need to reference.")]
     public async Task<string> ReadLocalDocumentAsync(
         [Description("The exact URI (local file path) provided in the Knowledge Base list")] string uri)
     {
@@ -20,32 +22,48 @@ public class LocalDocumentPlugin
                 return $"Error: The file at {uri} could not be found. It may have been deleted.";
             }
 
-            // We use Task.Run because OpenXML is synchronous, and we don't want to block the bot's thread
+            // Determine file type based on extension
+            bool isPdf = uri.EndsWith(".pdf", StringComparison.OrdinalIgnoreCase);
+
             return await Task.Run(() =>
             {
-                using WordprocessingDocument wordDoc = WordprocessingDocument.Open(uri, false);
-                var body = wordDoc.MainDocumentPart?.Document.Body;
-
-                if (body == null) return "The document appears to be empty.";
-
                 var sb = new StringBuilder();
-                
-                // Iterate through paragraphs to maintain basic line breaks
-                foreach (var paragraph in body.Elements<Paragraph>())
+
+                if (isPdf)
                 {
-                    sb.AppendLine(paragraph.InnerText);
+                    // --- PDF PARSING LOGIC ---
+                    using PdfDocument document = PdfDocument.Open(uri);
+                    foreach (var page in document.GetPages())
+                    {
+                        // ContentOrderTextExtractor does a great job maintaining paragraph structure
+                        var text = ContentOrderTextExtractor.GetText(page);
+                        sb.AppendLine(text);
+                        sb.AppendLine(); // Add a blank line between pages for readability
+                    }
+                }
+                else
+                {
+                    // --- DOCX PARSING LOGIC ---
+                    using WordprocessingDocument wordDoc = WordprocessingDocument.Open(uri, false);
+                    var body = wordDoc.MainDocumentPart?.Document.Body;
+
+                    if (body == null) return "The document appears to be empty.";
+
+                    foreach (var paragraph in body.Elements<Paragraph>())
+                    {
+                        sb.AppendLine(paragraph.InnerText);
+                    }
                 }
 
                 string extractedText = sb.ToString().Trim();
                 
-                // Optional safeguard: Truncate if the document is massively huge to save tokens
-                // (e.g., limit to 50,000 characters which is ~12,500 tokens)
+                // Safeguard: Truncate if the document is massively huge to save tokens
                 if (extractedText.Length > 50000)
                 {
                     extractedText = extractedText.Substring(0, 50000) + "\n\n[TRUNCATED due to length]";
                 }
 
-                return extractedText;
+                return string.IsNullOrWhiteSpace(extractedText) ? "The document appears to contain no readable text (it may be a scanned image)." : extractedText;
             });
         }
         catch (Exception ex)

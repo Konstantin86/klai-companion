@@ -17,6 +17,20 @@ public class NotionStateCache
         return Values.FirstOrDefault(v => v.Name == valueName);
     }
 
+    public NotionTask? GetTaskByName(string taskName)
+    {
+        var floatingTask = FloatingTasks.FirstOrDefault(t => t.Name.Contains(taskName, StringComparison.OrdinalIgnoreCase));
+        if (floatingTask != null) return floatingTask;
+
+        var projectTask = Values
+            .SelectMany(v => v.Goals)
+            .SelectMany(g => g.Projects)
+            .SelectMany(p => p.Tasks ?? new List<NotionTask>())
+            .FirstOrDefault(t => t.Name.Contains(taskName, StringComparison.OrdinalIgnoreCase));
+
+        return projectTask;
+    }
+
     public NotionActiveContext? GetActiveContextForTopic(int topicId, IConfiguration config)
     {
         // 1. Map the Telegram Topic ID to the Notion Value Name

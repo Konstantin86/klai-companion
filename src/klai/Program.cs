@@ -71,7 +71,8 @@ class Program
                     .AddFromType<LongTermMemoryPlugin>("LongTermMemory")
                     .AddFromType<LocalDocumentPlugin>("LocalDocument")
                     .AddFromType<GoogleSheetsPlugin>("GoogleSheets")
-                    .AddFromType<NotionPlannerPlugin>("NotionPlanner");
+                    .AddFromType<NotionPlannerPlugin>("NotionPlanner")
+                    .AddFromType<NotionTaskModifierPlugin>("NotionTaskModifier");
 
         // Register EF Core SQLite DbContext
         var sqliteConnectionString = builder.Configuration["SQLITE_CONNECTION_STRING"]

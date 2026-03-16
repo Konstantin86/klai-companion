@@ -12,7 +12,7 @@ public class NotionPlannerPlugin
     private readonly INotionClient _notionClient;
     private readonly NotionSyncWorker _syncWorker;
     private readonly string _tasksDbId;
-    private readonly string _projectsDbId; // NEW
+    private readonly string _projectsDbId;
 
     public NotionPlannerPlugin(INotionClient notionClient, NotionSyncWorker syncWorker, IConfiguration config)
     {

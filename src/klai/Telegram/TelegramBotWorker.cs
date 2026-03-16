@@ -195,43 +195,52 @@ public class TelegramBotWorker : BackgroundService
         // Strip the trigger word to isolate the user's description
         string description = messageText.Substring(trigger.Length).Trim();
 
-        // --- SCENARIO 1: Document Upload (.docx or .pdf) ---
+        // --- SCENARIO 1: Document Upload (.docx, .pdf, or ANY Text File) ---
         if (message.Document != null)
         {
-            var fileName = message.Document.FileName ?? string.Empty;
+            var fileName = message.Document.FileName ?? "unknown_file";
             bool isDocx = fileName.EndsWith(".docx", StringComparison.OrdinalIgnoreCase);
             bool isPdf = fileName.EndsWith(".pdf", StringComparison.OrdinalIgnoreCase);
-
-            if (!isDocx && !isPdf)
-            {
-                await botClient.SendMessage(message.Chat.Id, "⚠️ Currently, only .docx and .pdf files are supported.", messageThreadId: topicId, cancellationToken: cancellationToken);
-                return true;
-            }
 
             // 1. Download the file from Telegram's servers
             var fileInfo = await botClient.GetFile(message.Document.FileId, cancellationToken);
             string saveDirectory = Path.Combine("data", "files");
-            Directory.CreateDirectory(saveDirectory); // Ensure the folder exists
+            Directory.CreateDirectory(saveDirectory); 
 
-            // Add a short GUID to prevent filename collisions
             string uniqueFileName = $"{Guid.NewGuid().ToString().Substring(0, 8)}_{fileName}";
             string localFilePath = Path.Combine(saveDirectory, uniqueFileName);
 
-            using var fileStream = new FileStream(localFilePath, FileMode.Create);
-            await botClient.DownloadFile(fileInfo.FilePath, fileStream, cancellationToken);
+            using (var fileStream = new FileStream(localFilePath, FileMode.Create, FileAccess.ReadWrite))
+            {
+                await botClient.DownloadFile(fileInfo.FilePath, fileStream, cancellationToken);
+                
+                // 2. The Magic Check: If it's not a known rich format, check if it's plain text
+                if (!isDocx && !isPdf)
+                {
+                    if (!IsTextStream(fileStream))
+                    {
+                        // It's an image, executable, or unknown binary. Clean it up and abort.
+                        fileStream.Close();
+                        File.Delete(localFilePath);
+                        
+                        await botClient.SendMessage(message.Chat.Id, $"⚠️ `{fileName}` appears to be a binary file. I can only process PDFs, Word docs, and plain text files (code, json, txt, etc).", messageThreadId: topicId, parseMode: ParseMode.Markdown, cancellationToken: cancellationToken);
+                        return true;
+                    }
+                }
+            } // stream closes here
 
-            // 2. Save the artifact record to SQLite
+            // 3. Save the artifact record to SQLite
             dbContext.KnowledgeArtifacts.Add(new KnowledgeArtifact
             {
                 TopicId = topicId,
-                ArtifactType = "LocalDocument", // We can keep using LocalDocument for both!
+                ArtifactType = "LocalDocument", // Still keeping it unified!
                 Uri = localFilePath,
                 Description = string.IsNullOrWhiteSpace(description) ? fileName : description,
                 AddedAt = DateTime.UtcNow
             });
             await dbContext.SaveChangesAsync(cancellationToken);
 
-            await botClient.SendMessage(message.Chat.Id, $"✅ Saved `{fileName}` to the Knowledge Base for this topic.", messageThreadId: topicId, parseMode: ParseMode.Markdown, cancellationToken: cancellationToken);
+            await botClient.SendMessage(message.Chat.Id, $"✅ Saved `{fileName}` to the Knowledge Base.", messageThreadId: topicId, parseMode: ParseMode.Markdown, cancellationToken: cancellationToken);
             return true;
         }
 

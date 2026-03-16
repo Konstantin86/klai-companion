@@ -11,7 +11,7 @@ namespace klai.KnowledgeBase;
 public class LocalDocumentPlugin
 {
     [KernelFunction("ReadLocalDocument")]
-    [Description("Reads the text content of a local Microsoft Word (.docx) or PDF (.pdf) file. Use this when the Knowledge Base lists a LocalDocument URI that you need to reference.")]
+    [Description("Reads the text content of a local file (Word (.docx), PDF, or any plain text/code file). Use this when the Knowledge Base lists a LocalDocument URI that you need to reference.")]
     public async Task<string> ReadLocalDocumentAsync(
         [Description("The exact URI (local file path) provided in the Knowledge Base list")] string uri)
     {
@@ -24,8 +24,9 @@ public class LocalDocumentPlugin
 
             // Determine file type based on extension
             bool isPdf = uri.EndsWith(".pdf", StringComparison.OrdinalIgnoreCase);
+            bool isDocx = uri.EndsWith(".docx", StringComparison.OrdinalIgnoreCase);
 
-            return await Task.Run(() =>
+            return await Task.Run(async () =>
             {
                 var sb = new StringBuilder();
 
@@ -41,7 +42,7 @@ public class LocalDocumentPlugin
                         sb.AppendLine(); // Add a blank line between pages for readability
                     }
                 }
-                else
+                else if (isDocx)
                 {
                     // --- DOCX PARSING LOGIC ---
                     using WordprocessingDocument wordDoc = WordprocessingDocument.Open(uri, false);
@@ -53,6 +54,11 @@ public class LocalDocumentPlugin
                     {
                         sb.AppendLine(paragraph.InnerText);
                     }
+                }
+                else
+                {
+                    string rawText = await File.ReadAllTextAsync(uri);
+                    sb.Append(rawText);
                 }
 
                 string extractedText = sb.ToString().Trim();

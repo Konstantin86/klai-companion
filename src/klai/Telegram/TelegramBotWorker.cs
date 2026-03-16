@@ -267,19 +267,12 @@ public class TelegramBotWorker : BackgroundService
     private async Task<string> HandleGoalOrientedFlowAsync(string messageText, int topicId)
     {
         var activeContext = _notionCache.CurrentState.GetActiveContextForTopic(topicId, _config);
-
-        if (activeContext == null)
-        {
-            return $"Unmapped Topic ID ({topicId}). Please link it in `appconfig.json`.";
-        }
+        if (activeContext == null) { return $"Unmapped Topic ID ({topicId}). Please link it in `appconfig.json`."; }
 
         var routingTriggers = _config.GetSection("AiAgentConfig:RoutingTriggers").Get<string[]>() ?? ["/plan", "/deep"];
-        var knowledgeUploadTrigger = _config.GetValue<string>("KnowledgeUploadTrigger", "/kb");
-
         bool requiresDeepReasoning = routingTriggers.Any(t => messageText.StartsWith(t, StringComparison.OrdinalIgnoreCase));
 
         string serviceId = requiresDeepReasoning ? "advanced" : "fast";
-        // Grab the actual model name (e.g., "gpt-4o-mini") from config to feed to the tokenizer
         string modelName = _config[$"AiAgentConfig:Models:{(requiresDeepReasoning ? "Advanced" : "Fast")}"]!;
 
         if (requiresDeepReasoning)
@@ -290,24 +283,12 @@ public class TelegramBotWorker : BackgroundService
 
         // --- 1. LOAD CONTEXT & ENFORCE TOKEN BUDGET ---
         int maxNotionTokens = _config.GetValue<int>("AiAgentConfig:TokenBudgets:MaxNotionContext", 2000);
-
-        // Serialize WITHOUT indentation to save hundreds of formatting tokens
-        //var jsonOptions = new System.Text.Json.JsonSerializerOptions { WriteIndented = false };
-        //string rawNotionJson = System.Text.Json.JsonSerializer.Serialize(activeContext, jsonOptions);
-
         string rawNotionText = activeContext.ToTokenOptimizedString();
-
-        // The Gatekeeper: Ensure the JSON fits in the budget
         string safeNotionText = _tokenManager.TruncateToTokenLimit(rawNotionText, maxNotionTokens, modelName);
-
-        // --- 1.5 FETCH KNOWLEDGE BASE ARTIFACTS ---
         using var scope = _scopeFactory.CreateScope();
         var dbContext = scope.ServiceProvider.GetRequiredService<Data.KlaiDbContext>();
 
-        var artifacts = await dbContext.KnowledgeArtifacts
-            .Where(a => a.TopicId == topicId)
-            .OrderBy(a => a.AddedAt)
-            .ToListAsync();
+        var artifacts = await dbContext.KnowledgeArtifacts.Where(a => a.TopicId == topicId).OrderBy(a => a.AddedAt).ToListAsync();
 
         var kbBuilder = new System.Text.StringBuilder();
         if (artifacts.Any())
@@ -334,16 +315,16 @@ public class TelegramBotWorker : BackgroundService
         }
         string dynamicKbContext = kbBuilder.ToString();
 
+        var userProfile = string.Join("\n", _config.GetSection("AiAgentConfig:SystemPrompt:UserProfile").Get<string[]>() ?? Array.Empty<string>());
+        var criticalInstructions = string.Join("\n", _config.GetSection("AiAgentConfig:SystemPrompt:CriticalInstructions").Get<string[]>() ?? Array.Empty<string>());
+        var rulesOfEngagement = string.Join("\n", _config.GetSection("AiAgentConfig:SystemPrompt:RulesOfEngagement").Get<string[]>() ?? Array.Empty<string>());
+
         string systemPrompt = $@"
                 {activeContext.Value.SystemPrompt}
                 Today's date is {DateTime.UtcNow:yyyy-MM-dd}.
 
                 USER PROFILE:
-                My name is Kostya
-                Birthday: August 12 1986, height:175cm, weight: 83kg
-                Family: Married, 2 kids
-                Role: Delivery Manager with technical background (.NET, Microsoft Azure, Solutions Architecture)
-                Communication Style: Best-Friend Style, Direct, Technical, no fluff.
+                {userProfile}
 
                 CURRENT STATE (ACTIVE GOALS & PROJECTS):
                 {safeNotionText}
@@ -351,28 +332,18 @@ public class TelegramBotWorker : BackgroundService
                 {dynamicKbContext}
 
                 CRITICAL INSTRUCTIONS: 
-                1. BE EXTREMELY CONCISE. Keep your answers to up 2-3 short paragraphs maximum. Do not output long essays, lists, or full reports unless the user explicitly asks for a detailed breakdown. Get straight to the point.
+                {criticalInstructions}
                 
                 RULES OF ENGAGEMENT (AVAILABLE TOOLS & MISSING DATA):
-                - PAST FACTS & NOTES: If you need a historical fact, past decision, or personal context not in the prompt, DO NOT hallucinate. Use your Long-Term Memory search tool first.
-                - PROACTIVE INQUIRY: If you still lack critical numerical data (like salaries, budgets, or specific metrics) after searching your memory, STOP and ask me for it. Do not use placeholder assumptions to finish a task.
-                - MY CAREER: If I ask about my resume, skills, or job history, pull my CV.
-                - PROJECT TRACKING: If I ask about specific risks, milestones, or tabular data not in the active state, load the Project Spreadsheet.";
+                {rulesOfEngagement}";
 
         // --- TEMPORARY DEBUG DUMP ---
         try
         {
-            // Normalize any mixed line endings to your OS standard so it formats perfectly in VS Code / Notepad
             string formattedPrompt = systemPrompt.Replace("\r\n", "\n").Replace("\n", Environment.NewLine);
-
-            // Write it to the root directory of your app
             await System.IO.File.WriteAllTextAsync("debug_system_prompt.txt", formattedPrompt);
         }
-        catch (Exception ex)
-        {
-            // Silently swallow the error so a file-lock doesn't crash your bot
-            Console.WriteLine($"Could not write debug prompt: {ex.Message}");
-        }
+        catch (Exception ex) { Console.WriteLine($"Could not write debug prompt: {ex.Message}"); }
         // ----------------------------
 
         var executionSettings = new OpenAIPromptExecutionSettings

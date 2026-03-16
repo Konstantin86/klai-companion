@@ -48,18 +48,12 @@ public class MemoryConsolidationWorker : BackgroundService
                 _logger.LogWarning("⏳ Qdrant is still initializing. Retrying in 5 seconds...");
                 await Task.Delay(TimeSpan.FromSeconds(5), stoppingToken);
             }
-            catch (Exception ex) // Catch any other unexpected Qdrant startup errors
+            catch (Exception ex)
             {
                 _logger.LogError(ex, "Unexpected error connecting to Qdrant. Retrying...");
                 await Task.Delay(TimeSpan.FromSeconds(5), stoppingToken);
             }
         }
-
-
-
-
-        // Create the Qdrant collection if it doesn't exist yet
-        //await EnsureCollectionExistsAsync();
 
         while (!stoppingToken.IsCancellationRequested)
         {
@@ -76,10 +70,6 @@ public class MemoryConsolidationWorker : BackgroundService
                 _logger.LogError(ex, "Error during memory consolidation.");
             }
 
-            // For dev/testing, you might want to change this to TimeSpan.FromMinutes(5)
-
-
-            // 2. Read the interval from config dynamically (Defaults to 1440 mins / 24 hours if missing)
             var intervalMinutes = _config.GetValue<int>("AiAgentConfig:RAG:ConsolidationIntervalMinutes", 1440);
 
             _logger.LogInformation("Consolidation cycle complete. Sleeping for {Interval} minutes...", intervalMinutes);
@@ -100,14 +90,11 @@ public class MemoryConsolidationWorker : BackgroundService
         var notionSyncWorker = scope.ServiceProvider.GetRequiredService<NotionSyncWorker>();
         var notionCache = notionSyncWorker.CurrentState;
 
-        // 1. Load the Local Ledger for Notes
         var processedIds = await dbContext.VectorizedNotionItems
             .Where(v => v.ItemType == "Note")
             .Select(v => v.NotionId)
             .ToHashSetAsync(token);
 
-        // NOTE: Adjust `.Notes` below to match exactly how your NotionStateCache exposes the notes array 
-        // (e.g., notionCache.GetAllNotes() or notionCache.Values.Notes)
         var notesToProcess = notionCache.Notes?
             .Where(n => !processedIds.Contains(n.Id))
             .ToList() ?? new List<NotionNote>(); // Assuming your class is named Note

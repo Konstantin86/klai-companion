@@ -59,13 +59,10 @@ public class TelegramBotWorker : BackgroundService
 
     private async Task HandleUpdateAsync(ITelegramBotClient botClient, Update update, CancellationToken cancellationToken)
     {
-        // 1. Ensure we actually have a message object
         if (update.Message is not { } message) return;
 
-        // 2. Safely extract the text, checking both normal text and file captions
         string messageText = message.Text ?? message.Caption ?? string.Empty;
 
-        // 3. Ignore empty messages that don't have a document attached
         if (string.IsNullOrWhiteSpace(messageText) && message.Document == null) return;
 
         if (_allowedGroupId != 0 && message.Chat.Id != _allowedGroupId)
@@ -74,16 +71,24 @@ public class TelegramBotWorker : BackgroundService
             return;
         }
 
+        int? topicId = message.MessageThreadId;
+
+        // 1. Check for Knowledge Base Uploads First
+        if (topicId != null)
+        {
+            bool wasKbUpload = await HandleKnowledgeUploadAsync(botClient, message, topicId.Value, cancellationToken);
+            if (wasKbUpload) return; // Stop processing, the KB handler took care of it
+        }
+
+        string finalUserPrompt = messageText;
+
         // --- INTERCEPT /PLAN COMMAND ---
         var planTrigger = _config.GetValue<string>("ProjectPlanTrigger", "/plan");
         bool isPlanCommand = messageText.StartsWith(planTrigger, StringComparison.OrdinalIgnoreCase);
 
-        string finalUserPrompt = messageText;
         if (isPlanCommand)
         {
             string planContent = messageText.Substring(planTrigger.Length).Trim();
-
-            // Wrap their request in a strict, unbreakable rule
             finalUserPrompt = $@"[SYSTEM DIRECTIVE: The user invoked the project planning mode. 
                             You MUST evaluate this request and immediately use the 'NotionPlanner-CreateProjectWithTasks' tool to build this project and its timeline in Notion. 
                             Do not just list the steps in chat; you MUST call the tool and pass the JSON array.]
@@ -91,7 +96,51 @@ public class TelegramBotWorker : BackgroundService
                             User Request: {planContent}";
         }
 
-        int? topicId = message.MessageThreadId;
+        // --- EPHEMERAL DOCUMENT HANDLING ---
+        if (message.Document != null)
+        {
+            var fileName = message.Document.FileName ?? "unknown_file";
+            bool isDocx = fileName.EndsWith(".docx", StringComparison.OrdinalIgnoreCase);
+            bool isPdf = fileName.EndsWith(".pdf", StringComparison.OrdinalIgnoreCase);
+
+            string tempDirectory = Path.Combine("data", "temp");
+            Directory.CreateDirectory(tempDirectory);
+
+            string uniqueFileName = $"{Guid.NewGuid().ToString().Substring(0, 8)}_{fileName}";
+            string tempFilePath = Path.Combine(tempDirectory, uniqueFileName);
+
+            using (var fileStream = new FileStream(tempFilePath, FileMode.Create, FileAccess.ReadWrite))
+            {
+                var fileInfo = await botClient.GetFile(message.Document.FileId, cancellationToken);
+                await botClient.DownloadFile(fileInfo.FilePath, fileStream, cancellationToken);
+
+                if (!isDocx && !isPdf && !IsTextStream(fileStream))
+                {
+                    fileStream.Close();
+                    File.Delete(tempFilePath);
+                    await botClient.SendMessage(message.Chat.Id, "⚠️ I cannot process binary files for queries.", messageThreadId: topicId, cancellationToken: cancellationToken);
+                    return;
+                }
+            }
+
+            finalUserPrompt += $"\n\n[SYSTEM NOTE: The user attached a temporary file for this request. You MUST use the ReadLocalDocument tool on the following URI to read its contents before answering: {tempFilePath}]";
+            
+            await botClient.SendMessage(message.Chat.Id, $"⏳ Reading `{fileName}`...", messageThreadId: topicId, cancellationToken: cancellationToken);
+        }
+
+        // --- EPHEMERAL GOOGLE SHEET HANDLING ---
+        var sheetRegex = new System.Text.RegularExpressions.Regex(@"(https:\/\/docs\.google\.com\/spreadsheets\/d\/[a-zA-Z0-9-_]+)(?:.*?gid=(\d+))?\S*");
+        var match = sheetRegex.Match(messageText);
+
+        if (match.Success)
+        {
+            string baseUrl = match.Groups[1].Value;
+            string gid = match.Groups[2].Success ? match.Groups[2].Value : "0";
+            string cleanUri = $"{baseUrl}?gid={gid}";
+
+            finalUserPrompt += $"\n\n[SYSTEM NOTE: The user included a Google Sheet link in their request. You MUST use the ReadGoogleSheet tool on the following URI to read its contents before answering: {cleanUri}]";
+        }
+
         _logger.LogInformation("Received: '{Text}' | Topic ID: {Topic}", messageText, topicId?.ToString() ?? "General");
 
         await botClient.SendChatAction(message.Chat.Id, ChatAction.Typing, messageThreadId: topicId, cancellationToken: cancellationToken);
@@ -105,18 +154,10 @@ public class TelegramBotWorker : BackgroundService
         {
             if (topicId == null)
             {
-                // pass finalUserPrompt instead of messageText
                 responseText = await HandleGenericQaAsync(finalUserPrompt);
             }
             else
             {
-                bool wasKbUpload = await HandleKnowledgeUploadAsync(botClient, message, topicId.Value, cancellationToken);
-                if (wasKbUpload)
-                {
-                    return;
-                }
-
-                // pass finalUserPrompt instead of messageText
                 responseText = await HandleGoalOrientedFlowAsync(finalUserPrompt, topicId.Value);
             }
 

@@ -74,6 +74,16 @@ class Program
                     .AddFromType<NotionPlannerPlugin>("NotionPlanner")
                     .AddFromType<NotionTaskModifierPlugin>("NotionTaskModifier");
 
+        // --- CLEAN UP TEMP FOLDER ON STARTUP ---
+        string tempDirectory = Path.Combine("data", "temp");
+        if (Directory.Exists(tempDirectory))
+        {
+            // Delete the folder and everything inside it, then recreate it empty
+            Directory.Delete(tempDirectory, true);
+            Directory.CreateDirectory(tempDirectory);
+        }
+        // ---------------------------------------
+
         // Register EF Core SQLite DbContext
         var sqliteConnectionString = builder.Configuration["SQLITE_CONNECTION_STRING"]
             ?? "Data Source=data/klai_memory.db";

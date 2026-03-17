@@ -73,6 +73,27 @@ public class TelegramBotWorker : BackgroundService
 
         int? topicId = message.MessageThreadId;
 
+        if (messageText.Equals("/?", StringComparison.OrdinalIgnoreCase))
+        {
+            string manual =
+                "🤖 <b>Klai Companion Manual</b>\n\n" +
+                "<code>/kb</code> - List all Knowledge Base artifacts in this topic.\n" +
+                "<code>/kb</code> + <b>Upload File</b> - Save a file to the Knowledge Base.\n" +
+                "<code>/kb-update &lt;Id&gt;</code> + <b>Upload File</b> - Replace an existing artifact.\n" +
+                "<code>/kb-remove &lt;Id&gt;</code> - Delete an artifact from the KB.\n" +
+                "<code>/plan &lt;description&gt;</code> - Create a Notion project and timeline.\n" +
+                "<code>/deep &lt;prompt&gt;</code> - Route query to the advanced reasoning model.\n\n" +
+                "<b>Normal Chat:</b> Just talk to me natively. You can also upload files without commands and I will read them temporarily for that specific request.";
+
+            await botClient.SendMessage(
+                chatId: message.Chat.Id,
+                text: manual,
+                messageThreadId: topicId,
+                parseMode: ParseMode.Html, // Using HTML to prevent Markdown parser crashes
+                cancellationToken: cancellationToken);
+            return;
+        }
+
         // 1. Check for Knowledge Base Uploads First
         if (topicId != null)
         {

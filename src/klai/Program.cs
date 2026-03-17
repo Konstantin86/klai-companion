@@ -7,6 +7,7 @@ using klai.Notion;
 using klai.RAG;
 using klai.Telegram;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.AI;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -59,13 +60,12 @@ class Program
                         apiKey: apiKey,
                         serviceId: "advanced"
                     )
-                    // --- REVERT BACK TO THE OLD METHOD ---
                     .AddAzureOpenAITextEmbeddingGeneration(
                         deploymentName: embeddingModel,
                         endpoint: endpoint,
                         apiKey: apiKey,
                         serviceId: "embedding",
-                        dimensions: 3072 // Keep this!
+                        dimensions: 3072
                     )
                     .Plugins.AddFromType<TimePlugin>("Time")
                     .AddFromType<LongTermMemoryPlugin>("LongTermMemory")
@@ -73,6 +73,7 @@ class Program
                     .AddFromType<GoogleSheetsPlugin>("GoogleSheets")
                     .AddFromType<NotionPlannerPlugin>("NotionPlanner")
                     .AddFromType<NotionTaskModifierPlugin>("NotionTaskModifier");
+
 
         // --- CLEAN UP TEMP FOLDER ON STARTUP ---
         string tempDirectory = Path.Combine("data", "temp");

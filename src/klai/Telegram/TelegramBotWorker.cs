@@ -15,6 +15,7 @@ using klai.LLM;
 using Microsoft.SemanticKernel.Connectors.OpenAI;
 using Microsoft.EntityFrameworkCore;
 using klai.Sql.Model;
+using System.Collections.Concurrent;
 
 namespace klai.Telegram;
 
@@ -28,8 +29,7 @@ public class TelegramBotWorker : BackgroundService
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly TokenManagementService _tokenManager;
     private readonly long _allowedGroupId;
-
-
+    private readonly ConcurrentDictionary<string, List<Message>> _mediaGroupCache = new();
 
     public TelegramBotWorker(IConfiguration configuration, ILogger<TelegramBotWorker> logger, NotionSyncWorker notionCache, Kernel kernel, IServiceScopeFactory scopeFactory, TokenManagementService tokenManager)
     {
@@ -59,13 +59,83 @@ public class TelegramBotWorker : BackgroundService
 
     private async Task HandleUpdateAsync(ITelegramBotClient botClient, Update update, CancellationToken cancellationToken)
     {
-        if (update.Message is not { } message) return;
+        // if (update.Message is not { } message) return;
 
-        string messageText = message.Text ?? message.Caption ?? string.Empty;
+        // string messageText = message.Text ?? message.Caption ?? string.Empty;
 
-        if (string.IsNullOrWhiteSpace(messageText) && message.Document == null) return;
+        // if (string.IsNullOrWhiteSpace(messageText) && message.Document == null) return;
 
-        if (_allowedGroupId != 0 && message.Chat.Id != _allowedGroupId)
+        // if (_allowedGroupId != 0 && message.Chat.Id != _allowedGroupId)
+        // {
+        //     _logger.LogWarning("Unauthorized access attempt from Chat ID: {ChatId}", message.Chat.Id);
+        //     return;
+        // }
+
+        Message? message = null;
+        string messageText = string.Empty;
+        List<Message> groupedMessages = new List<Message>();
+
+        // --- ROUTING & BOT NAME STRIPPER ---
+        if (update.Type == UpdateType.Message && update.Message != null)
+        {
+            message = update.Message;
+
+            // --- 1. THE MEDIA GROUP AGGREGATOR ---
+            if (message.MediaGroupId != null)
+            {
+                var group = _mediaGroupCache.GetOrAdd(message.MediaGroupId, _ => new List<Message>());
+                lock (group) { group.Add(message); }
+
+                if (group.Count == 1)
+                {
+                    // We are the first file. Wait 1.5 seconds for the rest to arrive from Telegram.
+                    await Task.Delay(1500, cancellationToken);
+                    _mediaGroupCache.TryRemove(message.MediaGroupId, out groupedMessages);
+                }
+                else
+                {
+                    // We are file 2, 3, etc. Just add to the list and terminate this thread.
+                    // The thread holding the 1st file will process us after the delay.
+                    return;
+                }
+            }
+            else
+            {
+                groupedMessages = new List<Message> { message };
+            }
+            // -------------------------------------
+
+            // 2. Extract the text (Caption is usually only on the first grouped message)
+            var messageWithText = groupedMessages.FirstOrDefault(m => !string.IsNullOrWhiteSpace(m.Caption ?? m.Text));
+            messageText = messageWithText?.Text ?? messageWithText?.Caption ?? string.Empty;
+
+            // 3. Strip "@klaiassist_bot"
+            if (messageText.StartsWith("/"))
+            {
+                int atIndex = messageText.IndexOf('@');
+                int spaceIndex = messageText.IndexOf(' ');
+
+                if (atIndex > 0 && (spaceIndex == -1 || atIndex < spaceIndex))
+                {
+                    int endOfBotName = spaceIndex > -1 ? spaceIndex : messageText.Length;
+                    messageText = messageText.Remove(atIndex, endOfBotName - atIndex);
+                }
+            }
+        }
+        else if (update.Type == UpdateType.CallbackQuery && update.CallbackQuery != null)
+        {
+            await botClient.AnswerCallbackQuery(update.CallbackQuery.Id, cancellationToken: cancellationToken);
+            message = update.CallbackQuery.Message;
+            messageText = update.CallbackQuery.Data ?? string.Empty;
+            groupedMessages = new List<Message> { message! };
+            if (message == null) return;
+        }
+        else { return; }
+
+        // If there's no text and absolutely no files in the group, abort.
+        if (string.IsNullOrWhiteSpace(messageText) && !groupedMessages.Any(m => m.Document != null || m.Photo != null)) return;
+
+        if (_allowedGroupId != 0 && message!.Chat.Id != _allowedGroupId)
         {
             _logger.LogWarning("Unauthorized access attempt from Chat ID: {ChatId}", message.Chat.Id);
             return;
@@ -97,7 +167,7 @@ public class TelegramBotWorker : BackgroundService
         // 1. Check for Knowledge Base Uploads First
         if (topicId != null)
         {
-            bool wasKbUpload = await HandleKnowledgeUploadAsync(botClient, message, topicId.Value, cancellationToken);
+            bool wasKbUpload = await HandleKnowledgeUploadAsync(botClient, groupedMessages, messageText, topicId.Value, cancellationToken);
             if (wasKbUpload) return; // Stop processing, the KB handler took care of it
         }
 
@@ -118,35 +188,55 @@ public class TelegramBotWorker : BackgroundService
         }
 
         // --- EPHEMERAL DOCUMENT HANDLING ---
-        if (message.Document != null)
+        foreach (var msg in groupedMessages)
         {
-            var fileName = message.Document.FileName ?? "unknown_file";
-            bool isDocx = fileName.EndsWith(".docx", StringComparison.OrdinalIgnoreCase);
-            bool isPdf = fileName.EndsWith(".pdf", StringComparison.OrdinalIgnoreCase);
+            string? fileId = null;
+            string fileName = "unknown_file";
 
-            string tempDirectory = Path.Combine("data", "temp");
-            Directory.CreateDirectory(tempDirectory);
-
-            string uniqueFileName = $"{Guid.NewGuid().ToString().Substring(0, 8)}_{fileName}";
-            string tempFilePath = Path.Combine(tempDirectory, uniqueFileName);
-
-            using (var fileStream = new FileStream(tempFilePath, FileMode.Create, FileAccess.ReadWrite))
+            if (msg.Document != null)
             {
-                var fileInfo = await botClient.GetFile(message.Document.FileId, cancellationToken);
-                await botClient.DownloadFile(fileInfo.FilePath, fileStream, cancellationToken);
-
-                if (!isDocx && !isPdf && !IsTextStream(fileStream))
-                {
-                    fileStream.Close();
-                    File.Delete(tempFilePath);
-                    await botClient.SendMessage(message.Chat.Id, "⚠️ I cannot process binary files for queries.", messageThreadId: topicId, cancellationToken: cancellationToken);
-                    return;
-                }
+                fileId = msg.Document.FileId;
+                fileName = msg.Document.FileName ?? "unknown_file";
+            }
+            else if (msg.Photo != null && msg.Photo.Length > 0)
+            {
+                var bestPhoto = msg.Photo.OrderByDescending(p => p.FileSize).First();
+                fileId = bestPhoto.FileId;
+                fileName = $"photo_{bestPhoto.FileUniqueId}.jpg";
             }
 
-            finalUserPrompt += $"\n\n[SYSTEM NOTE: The user attached a temporary file for this request. You MUST use the ReadLocalDocument tool on the following URI to read its contents before answering: {tempFilePath}]";
+            if (fileId != null)
+            {
+                bool isDocx = fileName.EndsWith(".docx", StringComparison.OrdinalIgnoreCase);
+                bool isPdf = fileName.EndsWith(".pdf", StringComparison.OrdinalIgnoreCase);
+                bool isPptx = fileName.EndsWith(".pptx", StringComparison.OrdinalIgnoreCase);
+                bool isImage = fileName.EndsWith(".jpg", StringComparison.OrdinalIgnoreCase) ||
+                               fileName.EndsWith(".jpeg", StringComparison.OrdinalIgnoreCase) ||
+                               fileName.EndsWith(".png", StringComparison.OrdinalIgnoreCase);
 
-            await botClient.SendMessage(message.Chat.Id, $"⏳ Reading `{fileName}`...", messageThreadId: topicId, cancellationToken: cancellationToken);
+                string tempDirectory = Path.Combine("data", "temp");
+                Directory.CreateDirectory(tempDirectory);
+
+                string uniqueFileName = $"{Guid.NewGuid().ToString().Substring(0, 8)}_{fileName}";
+                string tempFilePath = Path.Combine(tempDirectory, uniqueFileName);
+
+                using (var fileStream = new FileStream(tempFilePath, FileMode.Create, FileAccess.ReadWrite))
+                {
+                    var fileInfo = await botClient.GetFile(fileId, cancellationToken);
+                    await botClient.DownloadFile(fileInfo.FilePath, fileStream, cancellationToken);
+
+                    if (!isDocx && !isPdf && !isPptx && !isImage && !IsTextStream(fileStream))
+                    {
+                        fileStream.Close();
+                        File.Delete(tempFilePath);
+                        await botClient.SendMessage(message.Chat.Id, $"⚠️ `{fileName}` is a binary file. Skipping.", messageThreadId: topicId, cancellationToken: cancellationToken);
+                        continue; // Skip this file, but process the others!
+                    }
+                }
+
+                finalUserPrompt += $"\n\n[SYSTEM NOTE: The user attached a file. Use ReadLocalDocument on: {tempFilePath}]";
+                await botClient.SendMessage(message.Chat.Id, $"⏳ Reading `{fileName}`...", messageThreadId: topicId, cancellationToken: cancellationToken);
+            }
         }
 
         // --- EPHEMERAL GOOGLE SHEET HANDLING ---
@@ -241,9 +331,8 @@ public class TelegramBotWorker : BackgroundService
         return response.Content ?? "No response generated.";
     }
 
-    private async Task<bool> HandleKnowledgeUploadAsync(ITelegramBotClient botClient, Message message, int topicId, CancellationToken cancellationToken)
+    private async Task<bool> HandleKnowledgeUploadAsync(ITelegramBotClient botClient, List<Message> groupedMessages, string messageText, int topicId, CancellationToken cancellationToken)
     {
-        string messageText = message.Text ?? message.Caption ?? string.Empty;
         var kbTrigger = _config.GetValue<string>("KnowledgeUploadTrigger", "/kb");
         var kbUpdateTrigger = "/kb-update";
         var kbRemoveTrigger = "/kb-remove";
@@ -255,11 +344,15 @@ public class TelegramBotWorker : BackgroundService
         if (!isKbUpload && !isKbUpdate && !isKbRemove)
             return false; // Not a KB command, let the LLM handle it
 
+        // Open the DB connection ONCE for the whole operation
         using var scope = _scopeFactory.CreateScope();
         var dbContext = scope.ServiceProvider.GetRequiredService<Data.KlaiDbContext>();
 
+        // We only need to check the first message for singular text commands
+        var firstMsg = groupedMessages.First();
+
         // --- SCENARIO 1: LIST ARTIFACTS (/kb with no attachments) ---
-        if (messageText.Trim().Equals(kbTrigger, StringComparison.OrdinalIgnoreCase) && message.Document == null)
+        if (messageText.Trim().Equals(kbTrigger, StringComparison.OrdinalIgnoreCase) && !groupedMessages.Any(m => m.Document != null || m.Photo != null))
         {
             var artifacts = await dbContext.KnowledgeArtifacts
                 .Where(a => a.TopicId == topicId)
@@ -268,24 +361,19 @@ public class TelegramBotWorker : BackgroundService
 
             if (!artifacts.Any())
             {
-                await botClient.SendMessage(message.Chat.Id, "📭 No knowledge base artifacts found for this topic.", messageThreadId: topicId, cancellationToken: cancellationToken);
+                await botClient.SendMessage(firstMsg.Chat.Id, "📭 No knowledge base artifacts found for this topic.", messageThreadId: topicId, cancellationToken: cancellationToken);
                 return true;
             }
 
-            // Use HTML tags instead of Markdown asterisks
             var sb = new System.Text.StringBuilder("📚 <b>Knowledge Base Artifacts:</b>\n\n");
             foreach (var a in artifacts)
             {
-                // Safely escape any stray HTML characters in the description or URI
                 string safeUri = a.Uri.Replace("&", "&amp;").Replace("<", "&lt;").Replace(">", "&gt;");
                 string safeDesc = (a.Description ?? "").Replace("&", "&amp;").Replace("<", "&lt;").Replace(">", "&gt;");
-
-                // Use <code> and <i> tags
                 sb.AppendLine($"<code>{a.Id}</code> - {safeUri} - <i>{safeDesc}</i>");
             }
 
-            // CRITICAL: Change ParseMode.Markdown to ParseMode.Html
-            await botClient.SendMessage(message.Chat.Id, sb.ToString(), messageThreadId: topicId, parseMode: ParseMode.Html, cancellationToken: cancellationToken);
+            await botClient.SendMessage(firstMsg.Chat.Id, sb.ToString(), messageThreadId: topicId, parseMode: ParseMode.Html, cancellationToken: cancellationToken);
             return true;
         }
 
@@ -295,79 +383,70 @@ public class TelegramBotWorker : BackgroundService
             var parts = messageText.Split(' ', StringSplitOptions.RemoveEmptyEntries);
             if (parts.Length < 2 || !int.TryParse(parts[1], out int artifactId))
             {
-                await botClient.SendMessage(message.Chat.Id, "⚠️ Invalid format. Use `/kb-remove <Id>`.", messageThreadId: topicId, parseMode: ParseMode.Markdown, cancellationToken: cancellationToken);
+                await botClient.SendMessage(firstMsg.Chat.Id, "⚠️ Invalid format. Use `/kb-remove <Id>`.", messageThreadId: topicId, parseMode: ParseMode.Markdown, cancellationToken: cancellationToken);
                 return true;
             }
 
-            // 1. Find the artifact and ensure it belongs to this specific chat topic
-            var existingArtifact = await dbContext.KnowledgeArtifacts
-                .FirstOrDefaultAsync(a => a.Id == artifactId && a.TopicId == topicId, cancellationToken);
-
+            var existingArtifact = await dbContext.KnowledgeArtifacts.FirstOrDefaultAsync(a => a.Id == artifactId && a.TopicId == topicId, cancellationToken);
             if (existingArtifact == null)
             {
-                await botClient.SendMessage(message.Chat.Id, $"⚠️ Artifact with ID `{artifactId}` not found in this topic.", messageThreadId: topicId, parseMode: ParseMode.Markdown, cancellationToken: cancellationToken);
+                await botClient.SendMessage(firstMsg.Chat.Id, $"⚠️ Artifact with ID `{artifactId}` not found in this topic.", messageThreadId: topicId, parseMode: ParseMode.Markdown, cancellationToken: cancellationToken);
                 return true;
             }
 
-            // 2. If it's a physical file on the Raspberry Pi, delete it to free up space
             if (existingArtifact.ArtifactType == "LocalDocument" && System.IO.File.Exists(existingArtifact.Uri))
             {
-                try
-                {
-                    System.IO.File.Delete(existingArtifact.Uri);
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogWarning(ex, "Could not delete artifact file: {Uri}. It might be locked or already deleted.", existingArtifact.Uri);
-                }
+                try { System.IO.File.Delete(existingArtifact.Uri); }
+                catch (Exception ex) { _logger.LogWarning(ex, "Could not delete artifact file: {Uri}", existingArtifact.Uri); }
             }
 
-            // 3. Remove the record from the SQLite database
             dbContext.KnowledgeArtifacts.Remove(existingArtifact);
             await dbContext.SaveChangesAsync(cancellationToken);
-
-            await botClient.SendMessage(message.Chat.Id, $"🗑️ Successfully removed Artifact `{artifactId}`.", messageThreadId: topicId, parseMode: ParseMode.Markdown, cancellationToken: cancellationToken);
+            await botClient.SendMessage(firstMsg.Chat.Id, $"🗑️ Successfully removed Artifact `{artifactId}`.", messageThreadId: topicId, parseMode: ParseMode.Markdown, cancellationToken: cancellationToken);
             return true;
         }
 
         // --- SCENARIO 2: UPDATE EXISTING ARTIFACT (/kb-update <Id>) ---
         if (isKbUpdate)
         {
-            if (message.Document == null)
+            // For updates, we just grab the first valid file from the group
+            var msgToUpdate = groupedMessages.FirstOrDefault(m => m.Document != null || m.Photo != null);
+            if (msgToUpdate == null)
             {
-                await botClient.SendMessage(message.Chat.Id, "⚠️ Please attach a new document when using `/kb-update <Id>`.", messageThreadId: topicId, cancellationToken: cancellationToken);
+                await botClient.SendMessage(firstMsg.Chat.Id, "⚠️ Please attach a new document when using `/kb-update <Id>`.", messageThreadId: topicId, cancellationToken: cancellationToken);
                 return true;
             }
 
-            // Parse the ID out of the command
             var parts = messageText.Split(' ', StringSplitOptions.RemoveEmptyEntries);
             if (parts.Length < 2 || !int.TryParse(parts[1], out int artifactId))
             {
-                await botClient.SendMessage(message.Chat.Id, "⚠️ Invalid format. Use `/kb-update <Id>` in the caption of your new file.", messageThreadId: topicId, cancellationToken: cancellationToken);
+                await botClient.SendMessage(firstMsg.Chat.Id, "⚠️ Invalid format. Use `/kb-update <Id>` in the caption.", messageThreadId: topicId, cancellationToken: cancellationToken);
                 return true;
             }
 
-            // Enforce Topic Security: Make sure the artifact belongs to the current chat/topic!
             var existingArtifact = await dbContext.KnowledgeArtifacts.FirstOrDefaultAsync(a => a.Id == artifactId && a.TopicId == topicId, cancellationToken);
-
-            if (existingArtifact == null)
+            if (existingArtifact == null || existingArtifact.ArtifactType != "LocalDocument")
             {
-                await botClient.SendMessage(message.Chat.Id, $"⚠️ Artifact with ID `{artifactId}` not found in this topic.", messageThreadId: topicId, parseMode: ParseMode.Markdown, cancellationToken: cancellationToken);
+                await botClient.SendMessage(firstMsg.Chat.Id, $"⚠️ Artifact `{artifactId}` not found or isn't a local file.", messageThreadId: topicId, parseMode: ParseMode.Markdown, cancellationToken: cancellationToken);
                 return true;
             }
 
-            if (existingArtifact.ArtifactType != "LocalDocument")
+            string? fileId = null;
+            string fileName = "unknown_file";
+
+            if (msgToUpdate.Document != null)
             {
-                await botClient.SendMessage(message.Chat.Id, "⚠️ I can only do direct file replacements for `LocalDocument` types.", messageThreadId: topicId, parseMode: ParseMode.Markdown, cancellationToken: cancellationToken);
-                return true;
+                fileId = msgToUpdate.Document.FileId;
+                fileName = msgToUpdate.Document.FileName ?? "unknown_file";
+            }
+            else if (msgToUpdate.Photo != null && msgToUpdate.Photo.Length > 0)
+            {
+                var bestPhoto = msgToUpdate.Photo.OrderByDescending(p => p.FileSize).First();
+                fileId = bestPhoto.FileId;
+                fileName = $"photo_{bestPhoto.FileUniqueId}.jpg";
             }
 
-            // 1. Download and validate the NEW file
-            var fileName = message.Document.FileName ?? "unknown_file";
-            bool isDocx = fileName.EndsWith(".docx", StringComparison.OrdinalIgnoreCase);
-            bool isPdf = fileName.EndsWith(".pdf", StringComparison.OrdinalIgnoreCase);
-
-            var fileInfo = await botClient.GetFile(message.Document.FileId, cancellationToken);
+            var fileInfo = await botClient.GetFile(fileId!, cancellationToken);
             string saveDirectory = Path.Combine("data", "files");
             Directory.CreateDirectory(saveDirectory);
 
@@ -377,86 +456,27 @@ public class TelegramBotWorker : BackgroundService
             using (var fileStream = new FileStream(newLocalFilePath, FileMode.Create, FileAccess.ReadWrite))
             {
                 await botClient.DownloadFile(fileInfo.FilePath, fileStream, cancellationToken);
-
-                if (!isDocx && !isPdf && !IsTextStream(fileStream))
-                {
-                    fileStream.Close();
-                    File.Delete(newLocalFilePath);
-                    await botClient.SendMessage(message.Chat.Id, $"⚠️ `{fileName}` appears to be a binary file. Update failed.", messageThreadId: topicId, parseMode: ParseMode.Markdown, cancellationToken: cancellationToken);
-                    return true;
-                }
             }
 
-            // 2. Delete the OLD file from the Raspberry Pi SD Card to save space
             if (System.IO.File.Exists(existingArtifact.Uri))
             {
-                try
-                {
-                    System.IO.File.Delete(existingArtifact.Uri);
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogWarning(ex, "Could not delete old artifact file: {OldUri}. It might be locked or already deleted.", existingArtifact.Uri);
-                }
+                try { System.IO.File.Delete(existingArtifact.Uri); }
+                catch { /* Ignore */ }
             }
 
-            // 3. Update the database record with the new URI path
             existingArtifact.Uri = newLocalFilePath;
-            existingArtifact.AddedAt = DateTime.UtcNow; // Touch the modified date
+            existingArtifact.AddedAt = DateTime.UtcNow;
             await dbContext.SaveChangesAsync(cancellationToken);
 
-            await botClient.SendMessage(message.Chat.Id, $"✅ Successfully updated Artifact `{artifactId}`. The new file is `{fileName}`.", messageThreadId: topicId, parseMode: ParseMode.Markdown, cancellationToken: cancellationToken);
+            await botClient.SendMessage(firstMsg.Chat.Id, $"✅ Successfully updated Artifact `{artifactId}`. The new file is `{fileName}`.", messageThreadId: topicId, parseMode: ParseMode.Markdown, cancellationToken: cancellationToken);
             return true;
         }
 
-        // --- SCENARIO 3: CREATE NEW ARTIFACT (/kb <description>) ---
-        // (This is your exact existing logic for new uploads)
-
+        // --- SCENARIO 3: CREATE NEW ARTIFACTS (/kb <description>) ---
         string description = messageText.Substring(kbTrigger.Length).Trim();
+        bool handledSomething = false;
 
-        if (message.Document != null)
-        {
-            var fileName = message.Document.FileName ?? "unknown_file";
-            bool isDocx = fileName.EndsWith(".docx", StringComparison.OrdinalIgnoreCase);
-            bool isPdf = fileName.EndsWith(".pdf", StringComparison.OrdinalIgnoreCase);
-
-            var fileInfo = await botClient.GetFile(message.Document.FileId, cancellationToken);
-            string saveDirectory = Path.Combine("data", "files");
-            Directory.CreateDirectory(saveDirectory);
-
-            string uniqueFileName = $"{Guid.NewGuid().ToString().Substring(0, 8)}_{fileName}";
-            string localFilePath = Path.Combine(saveDirectory, uniqueFileName);
-
-            using (var fileStream = new FileStream(localFilePath, FileMode.Create, FileAccess.ReadWrite))
-            {
-                await botClient.DownloadFile(fileInfo.FilePath, fileStream, cancellationToken);
-
-                if (!isDocx && !isPdf)
-                {
-                    if (!IsTextStream(fileStream))
-                    {
-                        fileStream.Close();
-                        File.Delete(localFilePath);
-                        await botClient.SendMessage(message.Chat.Id, $"⚠️ `{fileName}` appears to be a binary file. I can only process PDFs, Word docs, and plain text files.", messageThreadId: topicId, parseMode: ParseMode.Markdown, cancellationToken: cancellationToken);
-                        return true;
-                    }
-                }
-            }
-
-            dbContext.KnowledgeArtifacts.Add(new KnowledgeArtifact
-            {
-                TopicId = topicId,
-                ArtifactType = "LocalDocument",
-                Uri = localFilePath,
-                Description = string.IsNullOrWhiteSpace(description) ? fileName : description,
-                AddedAt = DateTime.UtcNow
-            });
-            await dbContext.SaveChangesAsync(cancellationToken);
-
-            await botClient.SendMessage(message.Chat.Id, $"✅ Saved `{fileName}` to the Knowledge Base.", messageThreadId: topicId, parseMode: ParseMode.Markdown, cancellationToken: cancellationToken);
-            return true;
-        }
-
+        // 1. Handle Google Sheets Links first
         var sheetRegex = new System.Text.RegularExpressions.Regex(@"(https:\/\/docs\.google\.com\/spreadsheets\/d\/[a-zA-Z0-9-_]+)(?:.*?gid=(\d+))?\S*");
         var match = sheetRegex.Match(messageText);
 
@@ -464,9 +484,7 @@ public class TelegramBotWorker : BackgroundService
         {
             string baseUrl = match.Groups[1].Value;
             string gid = match.Groups[2].Success ? match.Groups[2].Value : "0";
-            string fullUrl = match.Value;
-
-            description = description.Replace(fullUrl, "").Trim();
+            description = description.Replace(match.Value, "").Trim();
 
             dbContext.KnowledgeArtifacts.Add(new KnowledgeArtifact
             {
@@ -478,11 +496,80 @@ public class TelegramBotWorker : BackgroundService
             });
             await dbContext.SaveChangesAsync(cancellationToken);
 
-            await botClient.SendMessage(message.Chat.Id, $"✅ Linked Google Sheet (Tab ID: {gid}) to the Knowledge Base.", messageThreadId: topicId, cancellationToken: cancellationToken);
-            return true;
+            await botClient.SendMessage(firstMsg.Chat.Id, $"✅ Linked Google Sheet (Tab ID: {gid}) to the Knowledge Base.", messageThreadId: topicId, cancellationToken: cancellationToken);
+            handledSomething = true;
         }
 
-        await botClient.SendMessage(message.Chat.Id, "⚠️ I saw the `/kb` tag, but couldn't find a file attachment or a valid Google Sheets link.", messageThreadId: topicId, cancellationToken: cancellationToken);
+        // 2. Loop through all grouped files and save them
+        foreach (var msg in groupedMessages)
+        {
+            string? fileId = null;
+            string fileName = "unknown_file";
+
+            // Extract the right file/photo ID (just like Ephemeral handler)
+            if (msg.Document != null)
+            {
+                fileId = msg.Document.FileId;
+                fileName = msg.Document.FileName ?? "unknown_file";
+            }
+            else if (msg.Photo != null && msg.Photo.Length > 0)
+            {
+                var bestPhoto = msg.Photo.OrderByDescending(p => p.FileSize).First();
+                fileId = bestPhoto.FileId;
+                fileName = $"photo_{bestPhoto.FileUniqueId}.jpg";
+            }
+
+            if (fileId != null)
+            {
+                bool isDocx = fileName.EndsWith(".docx", StringComparison.OrdinalIgnoreCase);
+                bool isPdf = fileName.EndsWith(".pdf", StringComparison.OrdinalIgnoreCase);
+                bool isPptx = fileName.EndsWith(".pptx", StringComparison.OrdinalIgnoreCase);
+                bool isImage = fileName.EndsWith(".jpg", StringComparison.OrdinalIgnoreCase) ||
+                               fileName.EndsWith(".jpeg", StringComparison.OrdinalIgnoreCase) ||
+                               fileName.EndsWith(".png", StringComparison.OrdinalIgnoreCase);
+
+                var fileInfo = await botClient.GetFile(fileId, cancellationToken);
+                string saveDirectory = Path.Combine("data", "files");
+                Directory.CreateDirectory(saveDirectory);
+
+                string uniqueFileName = $"{Guid.NewGuid().ToString().Substring(0, 8)}_{fileName}";
+                string localFilePath = Path.Combine(saveDirectory, uniqueFileName);
+
+                using (var fileStream = new FileStream(localFilePath, FileMode.Create, FileAccess.ReadWrite))
+                {
+                    await botClient.DownloadFile(fileInfo.FilePath, fileStream, cancellationToken);
+
+                    if (!isDocx && !isPdf && !isPptx && !isImage && !IsTextStream(fileStream))
+                    {
+                        fileStream.Close();
+                        File.Delete(localFilePath);
+                        await botClient.SendMessage(firstMsg.Chat.Id, $"⚠️ `{fileName}` appears to be a binary file and was skipped.", messageThreadId: topicId, parseMode: ParseMode.Markdown, cancellationToken: cancellationToken);
+                        continue; // Skip this one, but process the next files!
+                    }
+                }
+
+                dbContext.KnowledgeArtifacts.Add(new KnowledgeArtifact
+                {
+                    TopicId = topicId,
+                    ArtifactType = "LocalDocument",
+                    Uri = localFilePath,
+                    Description = string.IsNullOrWhiteSpace(description) ? fileName : description,
+                    AddedAt = DateTime.UtcNow
+                });
+
+                // Save immediately so it gets a unique ID
+                await dbContext.SaveChangesAsync(cancellationToken);
+                await botClient.SendMessage(firstMsg.Chat.Id, $"✅ Saved `{fileName}` to the Knowledge Base.", messageThreadId: topicId, parseMode: ParseMode.Markdown, cancellationToken: cancellationToken);
+                handledSomething = true;
+            }
+        }
+
+        if (!handledSomething)
+        {
+            await botClient.SendMessage(firstMsg.Chat.Id, "⚠️ I saw the `/kb` tag, but couldn't find any valid files or Google Sheets links attached.", messageThreadId: topicId, cancellationToken: cancellationToken);
+        }
+
+        // Return true ONCE at the very end
         return true;
     }
 

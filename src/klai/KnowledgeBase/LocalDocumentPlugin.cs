@@ -9,6 +9,8 @@ using Microsoft.SemanticKernel;
 using Microsoft.SemanticKernel.Embeddings;
 using UglyToad.PdfPig;
 using UglyToad.PdfPig.DocumentLayoutAnalysis.TextExtractor;
+using DocumentFormat.OpenXml.Presentation;
+using Microsoft.SemanticKernel.ChatCompletion;
 
 namespace klai.KnowledgeBase;
 
@@ -33,6 +35,10 @@ public class LocalDocumentPlugin
 
             bool isPdf = uri.EndsWith(".pdf", StringComparison.OrdinalIgnoreCase);
             bool isDocx = uri.EndsWith(".docx", StringComparison.OrdinalIgnoreCase);
+            bool isPptx = uri.EndsWith(".pptx", StringComparison.OrdinalIgnoreCase);
+            bool isImage = uri.EndsWith(".jpg", StringComparison.OrdinalIgnoreCase) ||
+               uri.EndsWith(".jpeg", StringComparison.OrdinalIgnoreCase) ||
+               uri.EndsWith(".png", StringComparison.OrdinalIgnoreCase);
 
             string extractedText = await Task.Run(async () =>
             {
@@ -59,6 +65,102 @@ public class LocalDocumentPlugin
                             sb.AppendLine(paragraph.InnerText);
                         }
                     }
+                }
+                else if (isPptx)
+                {
+                    // --- PPTX PARSING LOGIC (WITH EMBEDDED IMAGES) ---
+                    using PresentationDocument pptDoc = PresentationDocument.Open(uri, false);
+                    PresentationPart? presentationPart = pptDoc.PresentationPart;
+
+                    if (presentationPart?.Presentation?.SlideIdList != null)
+                    {
+                        // Resolve the Vision AI service once for the whole presentation
+                        using var scope = _serviceProvider.CreateScope();
+                        var chatCompletion = scope.ServiceProvider.GetRequiredService<Kernel>().GetRequiredService<IChatCompletionService>("fast");
+
+                        int slideIndex = 1;
+
+                        foreach (SlideId slideId in presentationPart.Presentation.SlideIdList.Elements<SlideId>())
+                        {
+                            if (slideId.RelationshipId == null) continue;
+
+                            SlidePart slidePart = (SlidePart)presentationPart.GetPartById(slideId.RelationshipId);
+                            sb.AppendLine($"[Slide {slideIndex}]");
+
+                            // 1. EXTRACT STANDARD TEXT
+                            var texts = slidePart.Slide.Descendants<DocumentFormat.OpenXml.Drawing.Text>();
+                            foreach (var text in texts)
+                            {
+                                sb.Append(text.Text + " ");
+                            }
+                            sb.AppendLine();
+
+                            // 2. EXTRACT AND PROCESS IMAGES
+                            int imageIndex = 1;
+                            foreach (ImagePart imagePart in slidePart.ImageParts)
+                            {
+                                using Stream imageStream = imagePart.GetStream();
+
+                                // Filter out tiny images (logos, icons, bullet points) to save API calls
+                                // 15,000 bytes is a safe threshold for a meaningless icon.
+                                if (imageStream.Length < 15000) continue;
+
+                                using MemoryStream ms = new MemoryStream();
+                                await imageStream.CopyToAsync(ms);
+                                byte[] imageBytes = ms.ToArray();
+
+                                // OpenXML content types are usually "image/png", "image/jpeg", etc.
+                                string mimeType = imagePart.ContentType;
+
+                                try
+                                {
+                                    var chatHistory = new ChatHistory();
+                                    chatHistory.Add(new ChatMessageContent(AuthorRole.User, new ChatMessageContentItemCollection
+                        {
+                            new TextContent("Extract any text from this presentation slide image. If it is a chart, diagram, or architectural drawing, describe its contents and flow in detail."),
+                            new ImageContent(imageBytes, mimeType)
+                        }));
+
+                                    var response = await chatCompletion.GetChatMessageContentAsync(chatHistory);
+
+                                    sb.AppendLine($"\n  [Embedded Image {imageIndex} Description]:");
+                                    sb.AppendLine($"  {response.Content}");
+                                    imageIndex++;
+                                }
+                                catch (Exception ex)
+                                {
+                                    sb.AppendLine($"  [Failed to process image {imageIndex}: {ex.Message}]");
+                                }
+                            }
+
+                            sb.AppendLine("\n");
+                            slideIndex++;
+                        }
+                    }
+                }
+                else if (isImage)
+                {
+                    // --- VISION AI PARSING LOGIC ---
+                    // 1. Resolve the fast model to do the heavy lifting
+                    using var scope = _serviceProvider.CreateScope();
+                    var chatCompletion = scope.ServiceProvider.GetRequiredService<Kernel>().GetRequiredService<IChatCompletionService>("fast");
+
+                    // 2. Load the image from disk
+                    byte[] imageBytes = await File.ReadAllBytesAsync(uri);
+                    string mimeType = uri.EndsWith(".png", StringComparison.OrdinalIgnoreCase) ? "image/png" : "image/jpeg";
+
+                    // 3. Build a multimodal prompt asking the AI to act as an OCR scanner
+                    var chatHistory = new ChatHistory();
+                    chatHistory.Add(new ChatMessageContent(AuthorRole.User, new ChatMessageContentItemCollection
+                    {
+                        new TextContent("Please extract all readable text from this image exactly as written. If there are diagrams, charts, UI elements, or visual concepts, describe them in detail so I can understand the context purely through text."),
+                        new ImageContent(imageBytes, mimeType)
+                    }));
+
+                    // 4. Get the text description and append it!
+                    var response = await chatCompletion.GetChatMessageContentAsync(chatHistory);
+                    sb.AppendLine("[IMAGE CONTENT EXTRACTED VIA AI VISION]");
+                    sb.AppendLine(response.Content);
                 }
                 else
                 {

@@ -59,18 +59,6 @@ public class TelegramBotWorker : BackgroundService
 
     private async Task HandleUpdateAsync(ITelegramBotClient botClient, Update update, CancellationToken cancellationToken)
     {
-        // if (update.Message is not { } message) return;
-
-        // string messageText = message.Text ?? message.Caption ?? string.Empty;
-
-        // if (string.IsNullOrWhiteSpace(messageText) && message.Document == null) return;
-
-        // if (_allowedGroupId != 0 && message.Chat.Id != _allowedGroupId)
-        // {
-        //     _logger.LogWarning("Unauthorized access attempt from Chat ID: {ChatId}", message.Chat.Id);
-        //     return;
-        // }
-
         Message? message = null;
         string messageText = string.Empty;
         List<Message> groupedMessages = new List<Message>();
@@ -192,21 +180,36 @@ public class TelegramBotWorker : BackgroundService
         {
             string? fileId = null;
             string fileName = "unknown_file";
+            long? fileSizeBytes = null;
 
             if (msg.Document != null)
             {
                 fileId = msg.Document.FileId;
                 fileName = msg.Document.FileName ?? "unknown_file";
+                fileSizeBytes = msg.Document.FileSize;
             }
             else if (msg.Photo != null && msg.Photo.Length > 0)
             {
                 var bestPhoto = msg.Photo.OrderByDescending(p => p.FileSize).First();
                 fileId = bestPhoto.FileId;
                 fileName = $"photo_{bestPhoto.FileUniqueId}.jpg";
+                fileSizeBytes = bestPhoto.FileSize;
             }
 
             if (fileId != null)
             {
+                if (fileSizeBytes > 20971520)
+                {
+                    await botClient.SendMessage(
+                        msg.Chat.Id,
+                        $"⚠️ `{fileName}` is too large ({fileSizeBytes / 1024 / 1024} MB). Telegram limits bot downloads to 20MB. Please compress it or use a web link.",
+                        messageThreadId: topicId,
+                        parseMode: ParseMode.Markdown,
+                        cancellationToken: cancellationToken);
+
+                    continue; // Skip this massive file, but keep processing the smaller ones!
+                }
+
                 bool isDocx = fileName.EndsWith(".docx", StringComparison.OrdinalIgnoreCase);
                 bool isPdf = fileName.EndsWith(".pdf", StringComparison.OrdinalIgnoreCase);
                 bool isPptx = fileName.EndsWith(".pptx", StringComparison.OrdinalIgnoreCase);
@@ -433,17 +436,32 @@ public class TelegramBotWorker : BackgroundService
 
             string? fileId = null;
             string fileName = "unknown_file";
+            long? fileSizeBytes = null;
 
             if (msgToUpdate.Document != null)
             {
                 fileId = msgToUpdate.Document.FileId;
                 fileName = msgToUpdate.Document.FileName ?? "unknown_file";
+                fileSizeBytes = msgToUpdate.Document.FileSize;
             }
             else if (msgToUpdate.Photo != null && msgToUpdate.Photo.Length > 0)
             {
                 var bestPhoto = msgToUpdate.Photo.OrderByDescending(p => p.FileSize).First();
                 fileId = bestPhoto.FileId;
                 fileName = $"photo_{bestPhoto.FileUniqueId}.jpg";
+                fileSizeBytes = bestPhoto.FileSize;
+            }
+
+            if (fileSizeBytes > 20971520)
+            {
+                await botClient.SendMessage(
+                    firstMsg.Chat.Id,
+                    $"⚠️ `{fileName}` is too large ({fileSizeBytes / 1024 / 1024} MB). Telegram limits bot downloads to 20MB. Please compress it or use a web link.",
+                    messageThreadId: topicId,
+                    parseMode: ParseMode.Markdown,
+                    cancellationToken: cancellationToken);
+
+                return false;
             }
 
             var fileInfo = await botClient.GetFile(fileId!, cancellationToken);
@@ -505,18 +523,34 @@ public class TelegramBotWorker : BackgroundService
         {
             string? fileId = null;
             string fileName = "unknown_file";
+            long? fileSizeBytes = null;
 
             // Extract the right file/photo ID (just like Ephemeral handler)
             if (msg.Document != null)
             {
                 fileId = msg.Document.FileId;
                 fileName = msg.Document.FileName ?? "unknown_file";
+                fileSizeBytes = msg.Document.FileSize;
             }
             else if (msg.Photo != null && msg.Photo.Length > 0)
             {
                 var bestPhoto = msg.Photo.OrderByDescending(p => p.FileSize).First();
                 fileId = bestPhoto.FileId;
                 fileName = $"photo_{bestPhoto.FileUniqueId}.jpg";
+                fileSizeBytes = bestPhoto.FileSize;
+            }
+
+
+            if (fileSizeBytes > 20971520)
+            {
+                await botClient.SendMessage(
+                    firstMsg.Chat.Id,
+                    $"⚠️ `{fileName}` is too large ({fileSizeBytes / 1024 / 1024} MB). Telegram limits bot downloads to 20MB. Please compress it or use a web link.",
+                    messageThreadId: topicId,
+                    parseMode: ParseMode.Markdown,
+                    cancellationToken: cancellationToken);
+
+                return false;
             }
 
             if (fileId != null)

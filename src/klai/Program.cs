@@ -31,10 +31,14 @@ class Program
 
         var endpoint = builder.Configuration["OPENAIENDPOINT"]!;
         var apiKey = builder.Configuration["OPENAIAPIKEY"]!;
+
+        var openAITTSEndpoint = builder.Configuration["OPENAITTSENDPOINT"]!;
+        var openAITTSApiKey = builder.Configuration["OPENAITTSAPIKEY"]!;
+
         var fastModel = builder.Configuration["AiAgentConfig:Models:Fast"]!;
         var advancedModel = builder.Configuration["AiAgentConfig:Models:Advanced"]!;
 
-        var embeddingModel = builder.Configuration["EMBEDDING_MODEL"] ?? "text-embedding-3-large";
+        var embeddingModel = builder.Configuration["EMBEDDING_MODEL_ID"] ?? "text-embedding-3-large";
         var qdrantEndpoint = builder.Configuration["QDRANT_ENDPOINT"] ?? "http://localhost:6333";
         var qdrantHost = builder.Configuration["QDRANT_HOST"] ?? "localhost";
         builder.Services.AddSingleton(sp => new QdrantClient(qdrantHost, 6334));
@@ -46,6 +50,9 @@ class Program
             var secret = config["NOTION_SECRET"] ?? throw new ArgumentNullException("NOTION_SECRET is missing");
             return NotionClientFactory.Create(new ClientOptions { AuthToken = secret });
         });
+
+        var sttModel = builder.Configuration["AiAgentConfig:Models:SpeechToText"] ?? "whisper";
+        var ttsModel = builder.Configuration["AiAgentConfig:Models:TextToSpeech"] ?? "tts";
 
         builder.Services.AddKernel()
                     .AddAzureOpenAIChatCompletion(
@@ -66,6 +73,17 @@ class Program
                         apiKey: apiKey,
                         serviceId: "embedding",
                         dimensions: 3072
+                    ).
+                    AddAzureOpenAIAudioToText(
+                        deploymentName: sttModel,
+                        endpoint: endpoint,
+                        apiKey: apiKey,
+                        serviceId: "audio-to-text"
+                    ).AddAzureOpenAITextToAudio(
+                        deploymentName: ttsModel,
+                        endpoint: openAITTSEndpoint,
+                        apiKey: openAITTSApiKey,
+                        serviceId: "text-to-audio"
                     )
                     .Plugins.AddFromType<TimePlugin>("Time")
                     .AddFromType<LongTermMemoryPlugin>("LongTermMemory")

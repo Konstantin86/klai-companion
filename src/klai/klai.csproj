@@ -19,6 +19,8 @@
 
     <PackageReference Include="dotenv.net" Version="4.0.1" />
 
+    <PackageReference Include="FFMpegCore" Version="5.4.0" />
+
     <PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite" Version="9.0.14" />
 
     <PackageReference Include="Microsoft.Extensions.DependencyInjection" Version="10.0.4" />

@@ -16,6 +16,9 @@ using Microsoft.SemanticKernel.Connectors.OpenAI;
 using Microsoft.EntityFrameworkCore;
 using klai.Sql.Model;
 using System.Collections.Concurrent;
+using FFMpegCore;
+using Microsoft.SemanticKernel.AudioToText;
+using Microsoft.SemanticKernel.TextToAudio;
 
 namespace klai.Telegram;
 
@@ -57,6 +60,105 @@ public class TelegramBotWorker : BackgroundService
         await Task.Delay(Timeout.Infinite, stoppingToken);
     }
 
+    private async Task SendVoiceResponseAsync(ITelegramBotClient botClient, long chatId, int? topicId, string text, CancellationToken cancellationToken)
+    {
+        string tempDir = Path.Combine("data", "temp");
+        Directory.CreateDirectory(tempDir);
+
+        string mp3Path = Path.Combine(tempDir, $"{Guid.NewGuid()}.mp3");
+        string oggPath = Path.Combine(tempDir, $"{Guid.NewGuid()}.ogg");
+
+        try
+        {
+            // 1. Generate Audio using Azure OpenAI TTS
+#pragma warning disable SKEXP0001
+            var ttsService = _kernel.GetRequiredService<ITextToAudioService>("text-to-audio");
+#pragma warning restore SKEXP0001
+
+            // Generate the raw audio bytes from the LLM's text
+            var audioContent = await ttsService.GetAudioContentAsync(text, null, _kernel, cancellationToken);
+            await System.IO.File.WriteAllBytesAsync(mp3Path, audioContent.Data!.Value.ToArray(), cancellationToken);
+
+            // 2. Convert MP3 to Telegram-compatible OGG Opus
+            // We use CustomArgument here because FFMpegCore doesn't have a strongly-typed Opus enum
+            await FFMpegArguments
+                .FromFileInput(mp3Path)
+                .OutputToFile(oggPath, true, options => options
+                    .WithCustomArgument("-c:a libopus -b:a 32k"))
+                .ProcessAsynchronously();
+
+            // 3. Upload and send as a native Telegram Voice Message
+            using var fileStream = new FileStream(oggPath, FileMode.Open, FileAccess.Read);
+            var inputFile = InputFile.FromStream(fileStream, "voice.ogg");
+
+            await botClient.SendVoice(
+                chatId: chatId,
+                voice: inputFile,
+                messageThreadId: topicId,
+                cancellationToken: cancellationToken
+            );
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to generate or send TTS voice response.");
+        }
+        finally
+        {
+            // 4. Garbage Collection
+            if (System.IO.File.Exists(mp3Path)) System.IO.File.Delete(mp3Path);
+            if (System.IO.File.Exists(oggPath)) System.IO.File.Delete(oggPath);
+        }
+    }
+
+    private async Task<string> TranscribeVoiceMessageAsync(ITelegramBotClient botClient, string fileId, CancellationToken cancellationToken)
+    {
+        var fileInfo = await botClient.GetFile(fileId, cancellationToken);
+
+        string tempDir = Path.Combine("data", "temp");
+        Directory.CreateDirectory(tempDir);
+
+        string oggPath = Path.Combine(tempDir, $"{Guid.NewGuid()}.ogg");
+        string mp3Path = Path.Combine(tempDir, $"{Guid.NewGuid()}.mp3"); // Changed to .mp3
+
+        try
+        {
+            // 1. Download the raw OGG Opus file from Telegram
+            using (var fileStream = new FileStream(oggPath, FileMode.Create, FileAccess.Write))
+            {
+                await botClient.DownloadFile(fileInfo.FilePath, fileStream, cancellationToken);
+            }
+
+            // 2. Convert to standard MP3 using FFmpeg
+            await FFMpegArguments
+                .FromFileInput(oggPath)
+                .OutputToFile(mp3Path, true, options => options
+                    .WithAudioCodec(FFMpegCore.Enums.AudioCodec.LibMp3Lame) // Use the available MP3 codec
+                    .WithAudioSamplingRate(16000))
+                .ProcessAsynchronously();
+
+            // 3. Send to Azure OpenAI Whisper
+            var audioBytes = await System.IO.File.ReadAllBytesAsync(mp3Path, cancellationToken);
+#pragma warning disable SKEXP0001
+            var audioContent = new AudioContent(audioBytes, "audio/mp3"); // Updated MIME type
+            var sttService = _kernel.GetRequiredService<IAudioToTextService>("audio-to-text");
+#pragma warning restore SKEXP0001
+            var result = await sttService.GetTextContentAsync(audioContent, null, _kernel, cancellationToken);
+
+            return result.Text ?? string.Empty;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to transcribe voice message.");
+            return "[VOICE MESSAGE UNREADABLE]";
+        }
+        finally
+        {
+            // 4. Garbage Collection
+            if (System.IO.File.Exists(oggPath)) System.IO.File.Delete(oggPath);
+            if (System.IO.File.Exists(mp3Path)) System.IO.File.Delete(mp3Path);
+        }
+    }
+
     private async Task HandleUpdateAsync(ITelegramBotClient botClient, Update update, CancellationToken cancellationToken)
     {
         Message? message = null;
@@ -91,24 +193,39 @@ public class TelegramBotWorker : BackgroundService
             {
                 groupedMessages = new List<Message> { message };
             }
-            // -------------------------------------
 
-            // 2. Extract the text (Caption is usually only on the first grouped message)
-            var messageWithText = groupedMessages.FirstOrDefault(m => !string.IsNullOrWhiteSpace(m.Caption ?? m.Text));
-            messageText = messageWithText?.Text ?? messageWithText?.Caption ?? string.Empty;
-
-            // 3. Strip "@klaiassist_bot"
-            if (messageText.StartsWith("/"))
+            // --- NEW: VOICE MESSAGE INTERCEPTION ---
+            var messageWithVoice = groupedMessages.FirstOrDefault(m => m.Voice != null);
+            if (messageWithVoice != null)
             {
-                int atIndex = messageText.IndexOf('@');
-                int spaceIndex = messageText.IndexOf(' ');
+                await botClient.SendChatAction(message.Chat.Id, ChatAction.Typing, messageThreadId: message.MessageThreadId, cancellationToken: cancellationToken);
 
-                if (atIndex > 0 && (spaceIndex == -1 || atIndex < spaceIndex))
+                // Transcribe it!
+                messageText = await TranscribeVoiceMessageAsync(botClient, messageWithVoice.Voice.FileId, cancellationToken);
+
+                // Send the transcription back to the chat so you know what the bot "heard"
+                await botClient.SendMessage(message.Chat.Id, $"🎤 _\"{messageText}\"_", messageThreadId: message.MessageThreadId, parseMode: ParseMode.Markdown, cancellationToken: cancellationToken);
+            }
+            else
+            {
+                // 2. Extract the text (Caption is usually only on the first grouped message)
+                var messageWithText = groupedMessages.FirstOrDefault(m => !string.IsNullOrWhiteSpace(m.Caption ?? m.Text));
+                messageText = messageWithText?.Text ?? messageWithText?.Caption ?? string.Empty;
+
+                // 3. Strip "@klaiassist_bot"
+                if (messageText.StartsWith("/"))
                 {
-                    int endOfBotName = spaceIndex > -1 ? spaceIndex : messageText.Length;
-                    messageText = messageText.Remove(atIndex, endOfBotName - atIndex);
+                    int atIndex = messageText.IndexOf('@');
+                    int spaceIndex = messageText.IndexOf(' ');
+
+                    if (atIndex > 0 && (spaceIndex == -1 || atIndex < spaceIndex))
+                    {
+                        int endOfBotName = spaceIndex > -1 ? spaceIndex : messageText.Length;
+                        messageText = messageText.Remove(atIndex, endOfBotName - atIndex);
+                    }
                 }
             }
+
         }
         else if (update.Type == UpdateType.CallbackQuery && update.CallbackQuery != null)
         {
@@ -284,6 +401,9 @@ public class TelegramBotWorker : BackgroundService
 
         await botClient.SendChatAction(message.Chat.Id, ChatAction.Typing, messageThreadId: topicId, cancellationToken: cancellationToken);
 
+
+        bool wasVoiceMessage = groupedMessages.Any(m => m.Voice != null);
+
         // Save the RAW text to memory so we don't pollute the DB with system directives
         await SaveMessageAsync(topicId, "User", messageText);
 
@@ -320,6 +440,18 @@ public class TelegramBotWorker : BackgroundService
             );
 
             await Task.Delay(100, cancellationToken);
+        }
+
+        // If you spoke to it, it speaks back!
+        if (wasVoiceMessage)
+        {
+            // Change the "typing..." indicator to "recording voice..."
+            await botClient.SendChatAction(message.Chat.Id, ChatAction.RecordVoice, messageThreadId: topicId, cancellationToken: cancellationToken);
+            
+            // Strip out markdown symbols (like **, `) before sending to TTS so it doesn't try to pronounce them
+            string cleanSpeechText = responseText.Replace("*", "").Replace("`", "");
+            
+            await SendVoiceResponseAsync(botClient, message.Chat.Id, topicId, cleanSpeechText, cancellationToken);
         }
     }
 

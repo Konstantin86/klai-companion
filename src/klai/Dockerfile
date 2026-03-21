@@ -14,9 +14,10 @@ RUN dotnet publish "klai.csproj" -c Release -o /app/publish /p:UseAppHost=false
 FROM mcr.microsoft.com/dotnet/runtime:9.0 AS final
 WORKDIR /app
 
+RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
+
 COPY --from=build /app/publish .
 
-# Create the data directory for SQLite so volume mapping doesn't fail
 RUN mkdir -p /app/data
 
 ENTRYPOINT ["dotnet", "klai.dll"]

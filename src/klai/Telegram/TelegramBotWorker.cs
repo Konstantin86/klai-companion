@@ -136,12 +136,37 @@ public class TelegramBotWorker : BackgroundService
             string manual =
                 "🤖 <b>Klai Companion Manual</b>\n\n" +
                 "<code>/kb</code> - List all Knowledge Base artifacts in this topic.\n" +
-                "<code>/kb</code> + <b>Upload File</b> - Save a file to the Knowledge Base.\n" +
-                "<code>/kb-update &lt;Id&gt;</code> + <b>Upload File</b> - Replace an existing artifact.\n" +
+                "<code>/kb</code> + <b>Upload File</b> + <b>Description</b> - Save a file to the Knowledge Base (see the list of supported files below).\n" +
+                "<code>/kb</code> + <b>Google Spreadsheet Link</b> + <b>Description</b> - Save a Google Spreadsheet to the Knowledge Base.\n" +
+                "<code>/kb-update &lt;Id&gt;</code> + <b>Upload File</b> - Replace an existing artifact (see the list of supported files below).\n" +
                 "<code>/kb-remove &lt;Id&gt;</code> - Delete an artifact from the KB.\n" +
                 "<code>/plan &lt;description&gt;</code> - Create a Notion project and timeline.\n" +
                 "<code>/deep &lt;prompt&gt;</code> - Route query to the advanced reasoning model.\n\n" +
-                "<b>Normal Chat:</b> Just talk to me natively. You can also upload files without commands and I will read them temporarily for that specific request.";
+                "<b>Normal Chat:</b> Just talk to me natively. You can also upload files without commands and I will read them temporarily for that specific request.\n\n" +
+                "<b>Plugins (Skills):</b>\n" +
+                " - Create Notion Tasks\n" +
+                " - Create Notion Projects with Tasks\n" +
+                " - Link existing Tasks to Notion Projects\n" +
+                " - Reschedule existing Tasks in Notion\n" +
+                " - Rename existing Tasks in Notion\n" +
+                " - Read files, Google Spreadsheets, Images\n" +
+                " - Search in Long-Term Memory Archive (see Memory principles below)\n\n" +
+                "<b>Supported Files:</b>\n" +
+                " - docx, pdf, pptx, text files (txt, csv, json, xml, etc...) up to 20MB\n" +
+                " - Google Spreadsheets\n" +
+                " - Images (jpg/jpeg, png) up to 20MB\n" +
+                " - Number of files is not limited (for inline upload or as a KB)\n\n" +
+                "<b>Context:</b>\n" +
+                " - Active Topic (Value) System Prompt (configurable in the appsettings.json)\n" +
+                " - User profile (configurable in the appsettings.json)\n" +
+                " - Active Topic Current State (Active Goals, Projects and Tasks) (Loaded from Notion each 5 minutes)\n" +
+                " - Available Knowledge Base Artifacts\n" +
+                " - Critical Persona Instructions (configurable in the appsettings.json)\n" +
+                " - Rules of Engagement (Available Tools & How to Handle Missing Data)\n" +
+                " - Chat History (10 most recent messages)\n\n" +
+                "<b>Memory:</b>\n" +
+                " - Short-Term (Contextual Awareness - see details in the \"Context\" section above)\n" +
+                " - Long-Term (RAG. Vectorized past chat conversations, archived or completed Notion goals, projects, old tasks, notes. Long-Term Memory is Refreshed once every 24 hours)\n";
 
             await botClient.SendMessage(
                 chatId: message.Chat.Id,

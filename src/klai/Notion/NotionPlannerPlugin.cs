@@ -58,7 +58,8 @@ public class NotionPlannerPlugin
             // 2. Build the complex Notion SDK Payload
             var properties = new Dictionary<string, PropertyValue>
             {
-                { "Name", new TitlePropertyValue { Title = new List<RichTextBase> { new RichTextTextInput { Text = new Text { Content = title } } } } }
+                { "Name", new TitlePropertyValue { Title = new List<RichTextBase> { new RichTextTextInput { Text = new Text { Content = title } } } } },
+                { "Type", new SelectPropertyValue { Select = new SelectOption { Name = "Regular" } } }
             };
 
             if (!string.IsNullOrEmpty(targetProjectId))
@@ -76,7 +77,8 @@ public class NotionPlannerPlugin
             var newPageParams = new PagesCreateParameters
             {
                 Parent = new DatabaseParentInput { DatabaseId = _tasksDbId },
-                Properties = properties
+                Properties = properties,
+                Icon = new EmojiObject { Emoji = "✔️" }
             };
 
             // 3. Send to Notion API

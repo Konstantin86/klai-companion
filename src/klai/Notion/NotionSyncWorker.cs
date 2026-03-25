@@ -3,6 +3,10 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Configuration;
 using Notion.Client;
 using klai.Notion.Model;
+using System.Net.Http;
+using System.Text;
+using Newtonsoft.Json;
+
 
 namespace klai.Notion;
 
@@ -22,6 +26,87 @@ public class NotionSyncWorker : BackgroundService
 
         var secret = _config["NOTION_SECRET"] ?? throw new ArgumentNullException("NOTION_SECRET is missing");
         _notionClient = NotionClientFactory.Create(new ClientOptions { AuthToken = secret });
+    }
+
+    public async Task<List<SafeNotionPage>> GetAllTasksSafelyAsync(string databaseId, string integrationToken, string? archiveColumnName = null, DateTime? modifiedAfter = null)
+    {
+        var allPages = new List<SafeNotionPage>();
+
+        using var httpClient = new HttpClient();
+        string url = $"https://api.notion.com/v1/data_sources/{databaseId}/query";
+
+        bool hasMore = true;
+        string nextCursor = null;
+
+        while (hasMore)
+        {
+            var request = new HttpRequestMessage(HttpMethod.Post, url);
+            request.Headers.Add("Authorization", $"Bearer {integrationToken}");
+
+            // Bumped to the version that officially supports the /data_sources endpoint
+            request.Headers.Add("Notion-Version", "2026-03-11");
+
+            // Build the payload
+            var requestBody = new Dictionary<string, object>();
+            if (!string.IsNullOrEmpty(nextCursor))
+            {
+                requestBody["start_cursor"] = nextCursor;
+            }
+
+            var filters = new List<object>();
+
+            // 1. Checkbox Filter
+            if (!string.IsNullOrEmpty(archiveColumnName))
+            {
+                filters.Add(new
+                {
+                    property = archiveColumnName,
+                    checkbox = new { equals = false }
+                });
+            }
+
+            // 2. Timestamp Filter
+            if (modifiedAfter.HasValue)
+            {
+                filters.Add(new
+                {
+                    timestamp = "last_edited_time",
+                    last_edited_time = new
+                    {
+                        on_or_after = modifiedAfter.Value.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+                    }
+                });
+            }
+
+            if (filters.Count == 1)
+            {
+                requestBody["filter"] = filters[0];
+            }
+            else if (filters.Count > 1)
+            {
+                requestBody["filter"] = new { and = filters };
+            }
+
+            var jsonPayload = JsonConvert.SerializeObject(requestBody);
+            request.Content = new StringContent(jsonPayload, Encoding.UTF8, "application/json");
+
+            var response = await httpClient.SendAsync(request);
+            response.EnsureSuccessStatusCode();
+
+            var rawJson = await response.Content.ReadAsStringAsync();
+
+            var pageData = JsonConvert.DeserializeObject<SafeQueryResponse>(rawJson);
+
+            if (pageData?.Results != null)
+            {
+                allPages.AddRange(pageData.Results);
+            }
+
+            hasMore = pageData?.HasMore ?? false;
+            nextCursor = pageData?.NextCursor;
+        }
+
+        return allPages;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -55,11 +140,11 @@ public class NotionSyncWorker : BackgroundService
 
     private async Task BuildInMemoryGraphAsync(DateTime cutoffDate)
     {
-        var valuesDbId = _config["AiAgentConfig:Notion:ValuesDbId"];
-        var goalsDbId = _config["AiAgentConfig:Notion:GoalsDbId"];
-        var projectsDbId = _config["AiAgentConfig:Notion:ProjectsDbId"];
-        var tasksDbId = _config["AiAgentConfig:Notion:TasksDbId"];
-        var notesDbId = _config["AiAgentConfig:Notion:NotesDbId"];
+        var valuesDbId = _config["AiAgentConfig:Notion:ValuesDbPageId"];
+        var goalsDbId = _config["AiAgentConfig:Notion:GoalsDbPageId"];
+        var projectsDbId = _config["AiAgentConfig:Notion:ProjectsDbPageId"];
+        var tasksDbId = _config["AiAgentConfig:Notion:TasksDbPageId"];
+        var notesDbId = _config["AiAgentConfig:Notion:NotesDbPageId"];
 
         var valuesTask = FetchAllPagesAsync(valuesDbId, "Archive");
         var goalsTask = FetchAllPagesAsync(goalsDbId, "Archived");
@@ -203,58 +288,25 @@ public class NotionSyncWorker : BackgroundService
 
     // --- Helper Methods to safely parse Notion API Properties ---
 
-    private async Task<List<Page>> FetchAllPagesAsync(string? databaseId, string? archiveColumnName, DateTime? modifiedAfter = null)
+    private async Task<List<SafeNotionPage>> FetchAllPagesAsync(string? databaseId, string? archiveColumnName, DateTime? modifiedAfter = null)
     {
-        if (string.IsNullOrEmpty(databaseId)) return new List<Page>();
-
-        var pages = new List<Page>();
-        string? cursor = null;
-
-        var queryParams = new DatabasesQueryParameters();
-        var filterList = new List<Filter>();
-
-        if (!string.IsNullOrEmpty(archiveColumnName))
-        {
-            filterList.Add(new CheckboxFilter(archiveColumnName, equal: false));
-        }
-
-        if (modifiedAfter.HasValue)
-        {
-            filterList.Add(new TimestampLastEditedTimeFilter
-            {
-                LastEditedTime = new DateFilter.Condition { OnOrAfter = modifiedAfter.Value }
-            });
-        }
-
-        if (filterList.Count > 1)
-        {
-            queryParams.Filter = new CompoundFilter { And = filterList };
-        }
-        else if (filterList.Count == 1)
-        {
-            queryParams.Filter = filterList.First();
-        }
+        if (string.IsNullOrEmpty(databaseId)) return new List<SafeNotionPage>();
+        var response = new List<SafeNotionPage>();
 
         try
         {
-            do
-            {
-                queryParams.StartCursor = cursor;
-                var response = await _notionClient.Databases.QueryAsync(databaseId, queryParams);
-                pages.AddRange(response.Results.OfType<Page>());
-                cursor = response.NextCursor;
-            }
-            while (cursor != null);
+            var secret = _config["NOTION_SECRET"] ?? throw new ArgumentNullException("NOTION_SECRET is missing");
+            response = await GetAllTasksSafelyAsync(databaseId, secret, archiveColumnName, modifiedAfter);
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Error fetching pages from Notion for Database ID: {DatabaseId}", databaseId);
         }
 
-        return pages;
+        return response;
     }
 
-    private string GetTitle(Page page, string propertyName)
+    private string GetTitle(SafeNotionPage page, string propertyName)
     {
         if (page.Properties.TryGetValue(propertyName, out var prop) && prop is TitlePropertyValue titleProp)
         {
@@ -263,7 +315,7 @@ public class NotionSyncWorker : BackgroundService
         return "";
     }
 
-    private DateTime? GetDate(Page page, string propertyName)
+    private DateTime? GetDate(SafeNotionPage page, string propertyName)
     {
         if (page.Properties.TryGetValue(propertyName, out var prop) && prop is DatePropertyValue dateProp && dateProp.Date != null)
         {
@@ -274,7 +326,7 @@ public class NotionSyncWorker : BackgroundService
         return null;
     }
 
-    private string GetStatus(Page page, string propertyName)
+    private string GetStatus(SafeNotionPage page, string propertyName)
     {
         if (page.Properties.TryGetValue(propertyName, out var prop) && prop is StatusPropertyValue statusProp)
         {
@@ -283,7 +335,7 @@ public class NotionSyncWorker : BackgroundService
         return "";
     }
 
-    private bool GetCheckbox(Page page, string propertyName)
+    private bool GetCheckbox(SafeNotionPage page, string propertyName)
     {
         if (page.Properties.TryGetValue(propertyName, out var prop) && prop is CheckboxPropertyValue checkboxProp)
         {
@@ -292,7 +344,7 @@ public class NotionSyncWorker : BackgroundService
         return false;
     }
 
-    private List<string> GetRelationIds(Page page, string propertyName)
+    private List<string> GetRelationIds(SafeNotionPage page, string propertyName)
     {
         if (page.Properties.TryGetValue(propertyName, out var prop) && prop is RelationPropertyValue relationProp)
         {
@@ -301,7 +353,7 @@ public class NotionSyncWorker : BackgroundService
         return new List<string>();
     }
 
-    private string GetSelect(Page page, string propertyName)
+    private string GetSelect(SafeNotionPage page, string propertyName)
     {
         if (page.Properties.TryGetValue(propertyName, out var prop) && prop is SelectPropertyValue selectProp)
         {
@@ -310,7 +362,7 @@ public class NotionSyncWorker : BackgroundService
         return "";
     }
 
-    private string GetUrlProperty(Page page, string propertyName)
+    private string GetUrlProperty(SafeNotionPage page, string propertyName)
     {
         if (page.Properties.TryGetValue(propertyName, out var prop) && prop is UrlPropertyValue urlProp)
         {
@@ -319,7 +371,7 @@ public class NotionSyncWorker : BackgroundService
         return "";
     }
 
-    private DateTime? GetCreatedTime(Page page, string propertyName)
+    private DateTime? GetCreatedTime(SafeNotionPage page, string propertyName)
     {
         if (page.Properties.TryGetValue(propertyName, out var prop) && prop is CreatedTimePropertyValue timeProp)
         {
@@ -328,7 +380,7 @@ public class NotionSyncWorker : BackgroundService
         return null;
     }
 
-    private DateTime? GetLastEditedTime(Page page, string propertyName)
+    private DateTime? GetLastEditedTime(SafeNotionPage page, string propertyName)
     {
         if (page.Properties.TryGetValue(propertyName, out var prop) && prop is LastEditedTimePropertyValue timeProp)
         {

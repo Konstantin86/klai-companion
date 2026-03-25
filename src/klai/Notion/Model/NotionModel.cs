@@ -1,9 +1,42 @@
 using System.Text;
 using System.Linq;
+using Newtonsoft.Json;
+using Notion.Client;
+using System.Collections.Generic;
 
 namespace klai.Notion.Model;
 
 
+
+public class SafeNotionPage
+{
+    // Reusing the SDK's properties, but omitting the Icon entirely
+    public string Id { get; set; }
+    
+    [Newtonsoft.Json.JsonProperty("url")]
+    public string Url { get; set; }
+    
+    [Newtonsoft.Json.JsonProperty("properties")]
+    public IDictionary<string, PropertyValue> Properties { get; set; }
+    
+    [Newtonsoft.Json.JsonProperty("created_time")]
+    public DateTime CreatedTime { get; set; }
+    
+    [Newtonsoft.Json.JsonProperty("last_edited_time")]
+    public DateTime LastEditedTime { get; set; }
+}
+
+public class SafeQueryResponse
+{
+    [Newtonsoft.Json.JsonProperty("results")]
+    public List<SafeNotionPage> Results { get; set; }
+    
+    [Newtonsoft.Json.JsonProperty("next_cursor")]
+    public string NextCursor { get; set; }
+    
+    [Newtonsoft.Json.JsonProperty("has_more")]
+    public bool HasMore { get; set; }
+}
 
 public class NotionActiveContext
 {

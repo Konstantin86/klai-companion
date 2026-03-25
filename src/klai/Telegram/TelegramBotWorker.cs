@@ -447,10 +447,10 @@ public class TelegramBotWorker : BackgroundService
         {
             // Change the "typing..." indicator to "recording voice..."
             await botClient.SendChatAction(message.Chat.Id, ChatAction.RecordVoice, messageThreadId: topicId, cancellationToken: cancellationToken);
-            
+
             // Strip out markdown symbols (like **, `) before sending to TTS so it doesn't try to pronounce them
             string cleanSpeechText = responseText.Replace("*", "").Replace("`", "");
-            
+
             await SendVoiceResponseAsync(botClient, message.Chat.Id, topicId, cleanSpeechText, cancellationToken);
         }
     }
@@ -819,9 +819,12 @@ public class TelegramBotWorker : BackgroundService
         var criticalInstructions = string.Join("\n", _config.GetSection("AiAgentConfig:SystemPrompt:CriticalInstructions").Get<string[]>() ?? Array.Empty<string>());
         var rulesOfEngagement = string.Join("\n", _config.GetSection("AiAgentConfig:SystemPrompt:RulesOfEngagement").Get<string[]>() ?? Array.Empty<string>());
 
+        string localDate = DateTime.Now.ToString("yyyy-MM-dd");
+        string localDayOfWeek = DateTime.Now.DayOfWeek.ToString();
+
         string systemPrompt = $@"
                 {activeContext.Value.SystemPrompt}
-                Today's date is {DateTime.UtcNow:yyyy-MM-dd}.
+                Today is {localDayOfWeek}, {localDate} (Local Time).
 
                 USER PROFILE:
                 {userProfile}

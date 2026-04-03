@@ -103,6 +103,29 @@ class Program
         }
         // ---------------------------------------
 
+        // --- NEW: Register Media Processing Services ---
+        
+        // 1. Register the Chunker (no HTTP needed)
+        builder.Services.AddTransient<MediaChunker>();
+
+        // 2. Register the Downloader with a typed HttpClient
+        builder.Services.AddHttpClient<DriveDownloader>();
+
+        // 3. Register the Azure Whisper Client with a typed HttpClient and your existing Azure credentials
+        builder.Services.AddHttpClient<AzureWhisperClient>()
+            .AddTypedClient<AzureWhisperClient>((httpClient, sp) =>
+            {
+                var config = sp.GetRequiredService<IConfiguration>();
+                
+                // Grab the exact same Azure credentials used by Semantic Kernel
+                var azureEndpoint = config["OPENAIENDPOINT"] ?? throw new ArgumentNullException("OPENAIENDPOINT");
+                var azureApiKey = config["OPENAIAPIKEY"] ?? throw new ArgumentNullException("OPENAIAPIKEY");
+                var deploymentName = config["AiAgentConfig:Models:SpeechToText"] ?? "whisper";
+
+                return new AzureWhisperClient(httpClient, azureEndpoint, deploymentName, azureApiKey);
+            });
+        // -----------------------------------------------
+
         // Register EF Core SQLite DbContext
         var sqliteConnectionString = builder.Configuration["SQLITE_CONNECTION_STRING"]
             ?? "Data Source=data/klai_memory.db";

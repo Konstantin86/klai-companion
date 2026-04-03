@@ -34,7 +34,11 @@ public class TelegramBotWorker : BackgroundService
     private readonly long _allowedGroupId;
     private readonly ConcurrentDictionary<string, List<Message>> _mediaGroupCache = new();
 
-    public TelegramBotWorker(IConfiguration configuration, ILogger<TelegramBotWorker> logger, NotionSyncWorker notionCache, Kernel kernel, IServiceScopeFactory scopeFactory, TokenManagementService tokenManager)
+    private readonly DriveDownloader _driveDownloader;
+    private readonly MediaChunker _mediaChunker;
+    private readonly AzureWhisperClient _azureWhisperClient;
+
+    public TelegramBotWorker(IConfiguration configuration, ILogger<TelegramBotWorker> logger, NotionSyncWorker notionCache, Kernel kernel, IServiceScopeFactory scopeFactory, TokenManagementService tokenManager, DriveDownloader driveDownloader, MediaChunker mediaChunker, AzureWhisperClient azureWhisperClient)
     {
         _logger = logger;
         _notionCache = notionCache;
@@ -42,6 +46,9 @@ public class TelegramBotWorker : BackgroundService
         _config = configuration;
         _scopeFactory = scopeFactory;
         _tokenManager = tokenManager;
+        _driveDownloader = driveDownloader;
+        _mediaChunker = mediaChunker;
+        _azureWhisperClient = azureWhisperClient;
 
         // Grab the token from your .env file
         var token = configuration["TELEGRAM_BOT_TOKEN"] ?? throw new ArgumentNullException("TELEGRAM_BOT_TOKEN is missing.");
@@ -408,16 +415,21 @@ public class TelegramBotWorker : BackgroundService
         await SaveMessageAsync(topicId, "User", messageText);
 
         string responseText;
+        string? rawTranscript = null; // NEW: Variable to hold the transcript if one is generated
 
         try
         {
             if (topicId == null)
             {
+                // Assuming HandleGenericQaAsync still just returns a standard string
                 responseText = await HandleGenericQaAsync(finalUserPrompt);
             }
             else
             {
-                responseText = await HandleGoalOrientedFlowAsync(finalUserPrompt, topicId.Value);
+                // NEW: Deconstruct the Tuple returned from the updated orchestrator
+                var result = await HandleGoalOrientedFlowAsync(finalUserPrompt, topicId.Value);
+                responseText = result.Response;
+                rawTranscript = result.RawTranscript;
             }
 
             await SaveMessageAsync(topicId, "Assistant", responseText);
@@ -441,6 +453,25 @@ public class TelegramBotWorker : BackgroundService
 
             await Task.Delay(100, cancellationToken);
         }
+
+        // --- NEW: SEND THE RAW TRANSCRIPT AS A .TXT ATTACHMENT ---
+        if (!string.IsNullOrWhiteSpace(rawTranscript))
+        {
+            // Convert the string into a byte array stream in memory (no hard drive I/O needed!)
+            using var stream = new System.IO.MemoryStream(System.Text.Encoding.UTF8.GetBytes(rawTranscript));
+
+            // Create the Telegram InputFile 
+            var inputFile = InputFile.FromStream(stream, $"Meeting_Transcript_{DateTime.Now:yyyyMMdd_HHmm}.txt");
+
+            await botClient.SendDocument(
+                chatId: message.Chat.Id,
+                messageThreadId: topicId, // Ensures it stays in the correct forum topic!
+                document: inputFile,
+                caption: "📄 Here is the raw transcript from your meeting.",
+                cancellationToken: cancellationToken
+            );
+        }
+        // ---------------------------------------------------------
 
         // If you spoke to it, it speaks back!
         if (wasVoiceMessage)
@@ -764,18 +795,49 @@ public class TelegramBotWorker : BackgroundService
         return true;
     }
 
-    private async Task<string> HandleGoalOrientedFlowAsync(string messageText, int topicId)
+    private async Task<(string Response, string? RawTranscript)> HandleGoalOrientedFlowAsync(string messageText, int topicId)
     {
         var activeContext = _notionCache.CurrentState.GetActiveContextForTopic(topicId, _config);
-        if (activeContext == null) { return $"Unmapped Topic ID ({topicId}). Please link it in `appconfig.json`."; }
+        if (activeContext == null) { return ($"Unmapped Topic ID ({topicId}).", null); }
 
-        var routingTriggers = _config.GetSection("AiAgentConfig:RoutingTriggers").Get<string[]>() ?? ["/plan", "/deep"];
+        var routingTriggers = _config.GetSection("AiAgentConfig:RoutingTriggers").Get<string[]>() ?? new[] { "/plan", "/deep" };
         bool requiresDeepReasoning = routingTriggers.Any(t => messageText.StartsWith(t, StringComparison.OrdinalIgnoreCase));
 
         string serviceId = requiresDeepReasoning ? "advanced" : "fast";
         string modelName = _config[$"AiAgentConfig:Models:{(requiresDeepReasoning ? "Advanced" : "Fast")}"]!;
 
-        if (requiresDeepReasoning)
+        // --- NEW: Variable to hold the transcript so we can return it at the end
+        string? capturedTranscript = null;
+
+        if (messageText.StartsWith("/transcript", StringComparison.OrdinalIgnoreCase))
+        {
+            var parts = messageText.Split(new[] { ' ' }, 3, StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Length < 2)
+                return ("Please provide a Google Drive link. Example: `/transcript [link] [instructions]`", null);
+
+            string driveLink = parts[1];
+            string userInstructions = parts.Length == 3 ? parts[2] : "Please provide a comprehensive summary of this meeting transcript.";
+
+            //string openAiKey = _config["AiAgentConfig:OpenAiApiKey"] ?? throw new Exception("OpenAI key missing");
+
+            string rawTranscript = await DownloadAndTranscribeAudioAsync(driveLink);
+
+            if (rawTranscript.StartsWith("Error")) return (rawTranscript, null);
+
+            // Save the transcript to our new variable
+            capturedTranscript = rawTranscript;
+
+            messageText = $@"I am providing a meeting transcript. Please perform the following task: '{userInstructions}'.
+
+TRANSCRIPT:
+{rawTranscript}";
+
+            requiresDeepReasoning = true;
+            serviceId = "advanced";
+            modelName = _config["AiAgentConfig:Models:Advanced"]!;
+        }
+
+        if (requiresDeepReasoning && !messageText.StartsWith("I am providing a meeting transcript"))
         {
             var triggerWord = routingTriggers.First(t => messageText.StartsWith(t, StringComparison.OrdinalIgnoreCase));
             messageText = messageText.Substring(triggerWord.Length).Trim();
@@ -873,7 +935,53 @@ public class TelegramBotWorker : BackgroundService
         chatHistory.AddUserMessage(messageText);
         var response = await chatCompletion.GetChatMessageContentAsync(chatHistory, executionSettings, _kernel);
 
-        return response.Content ?? "No response generated.";
+        // Return BOTH the LLM's summary and the captured transcript
+        return (response.Content ?? "No response generated.", capturedTranscript);
+    }
+
+    private async Task<string> DownloadAndTranscribeAudioAsync(string driveLink)
+    {
+        string sessionId = Guid.NewGuid().ToString();
+        string tempFolder = Path.Combine("data", "temp", $"KlaiTranscript_{sessionId}");
+        Directory.CreateDirectory(tempFolder);
+
+        try
+        {
+            // 1. Download Zoom .m4a to disk using injected downloader
+            string downloadedFile = await _driveDownloader.DownloadToDiskAsync(driveLink, tempFolder);
+
+            // 2. Slice the audio instantly
+            var chunkFiles = await _mediaChunker.SplitAudioAsync(downloadedFile, tempFolder);
+
+            // 3. Transcribe each chunk sequentially
+            var fullTranscript = new System.Text.StringBuilder();
+            string previousPrompt = "";
+
+            foreach (var chunk in chunkFiles)
+            {
+                // Pass the previous prompt to keep the AI's context flowing across cuts
+                string chunkText = await _azureWhisperClient.TranscribeChunkAsync(chunk, previousPrompt);
+                fullTranscript.AppendLine(chunkText);
+
+                // Save the last ~50 words to feed into the next chunk
+                var words = chunkText.Split(' ');
+                previousPrompt = string.Join(" ", words.Skip(Math.Max(0, words.Length - 50)));
+            }
+
+            return fullTranscript.ToString();
+        }
+        catch (Exception ex)
+        {
+            return $"Error processing transcript: {ex.Message}";
+        }
+        finally
+        {
+            // 4. Clean up the large audio files to prevent server disk bloat
+            if (Directory.Exists(tempFolder))
+            {
+                Directory.Delete(tempFolder, true);
+            }
+        }
     }
 
     private async Task<List<ChatMessageEntity>> GetRecentChatHistoryAsync(int topicId, int limit = 10)

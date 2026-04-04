@@ -847,6 +847,9 @@ TRANSCRIPT:
         int maxNotionTokens = _config.GetValue<int>("AiAgentConfig:TokenBudgets:MaxNotionContext", 2000);
         string rawNotionText = activeContext.ToTokenOptimizedString();
         string safeNotionText = _tokenManager.TruncateToTokenLimit(rawNotionText, maxNotionTokens, modelName);
+        Console.WriteLine($"{safeNotionText}");
+
+
         using var scope = _scopeFactory.CreateScope();
         var dbContext = scope.ServiceProvider.GetRequiredService<Data.KlaiDbContext>();
 

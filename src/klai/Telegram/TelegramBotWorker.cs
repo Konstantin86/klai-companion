@@ -244,6 +244,13 @@ public class TelegramBotWorker : BackgroundService
         }
         else { return; }
 
+        bool requestDebugLog = false;
+        if (messageText.StartsWith("/log ", StringComparison.OrdinalIgnoreCase) || messageText.Equals("/log", StringComparison.OrdinalIgnoreCase))
+        {
+            requestDebugLog = true;
+            messageText = messageText.Substring(4).Trim(); // Strip "/log" so the rest of the flow is uninterrupted
+        }
+
         // If there's no text and absolutely no files in the group, abort.
         if (string.IsNullOrWhiteSpace(messageText) && !groupedMessages.Any(m => m.Document != null || m.Photo != null)) return;
 
@@ -450,21 +457,25 @@ public class TelegramBotWorker : BackgroundService
         await SaveMessageAsync(topicId, "User", messageText);
 
         string responseText;
-        string? rawTranscript = null; // NEW: Variable to hold the transcript if one is generated
+        string? rawTranscript = null; 
+        string? generatedDebugLog = null; // NEW
 
         try
         {
             if (topicId == null)
             {
                 // Assuming HandleGenericQaAsync still just returns a standard string
-                responseText = await HandleGenericQaAsync(finalUserPrompt);
+                var result = await HandleGenericQaAsync(finalUserPrompt, requestDebugLog);
+                responseText = result.Response;
+                generatedDebugLog = result.DebugLog; // Capture the log
             }
             else
             {
                 // NEW: Deconstruct the Tuple returned from the updated orchestrator
-                var result = await HandleGoalOrientedFlowAsync(finalUserPrompt, topicId.Value);
+                var result = await HandleGoalOrientedFlowAsync(finalUserPrompt, topicId.Value, requestDebugLog);
                 responseText = result.Response;
                 rawTranscript = result.RawTranscript;
+                generatedDebugLog = result.DebugLog;
             }
 
             await SaveMessageAsync(topicId, "Assistant", responseText);
@@ -519,6 +530,20 @@ public class TelegramBotWorker : BackgroundService
 
             await SendVoiceResponseAsync(botClient, message.Chat.Id, topicId, cleanSpeechText, cancellationToken);
         }
+
+        if (!string.IsNullOrWhiteSpace(generatedDebugLog))
+        {
+            using var stream = new System.IO.MemoryStream(System.Text.Encoding.UTF8.GetBytes(generatedDebugLog));
+            var inputFile = InputFile.FromStream(stream, $"Debug_Context_{DateTime.Now:yyyyMMdd_HHmm}.txt");
+
+            await botClient.SendDocument(
+                chatId: message.Chat.Id,
+                messageThreadId: topicId,
+                document: inputFile,
+                caption: "🐛 Here is the full context window for this request.",
+                cancellationToken: cancellationToken
+            );
+        }
     }
 
     private List<string> ChunkMessage(string text, int maxLength = 4000)
@@ -547,14 +572,32 @@ public class TelegramBotWorker : BackgroundService
         return chunks;
     }
 
-    private async Task<string> HandleGenericQaAsync(string messageText)
+    private async Task<(string Response, string? DebugLog)> HandleGenericQaAsync(string messageText, bool requestDebugLog)
     {
         _logger.LogInformation("Routing to Generic Q&A (Fast Model)");
         var chatCompletion = _kernel.GetRequiredService<IChatCompletionService>("fast");
-        var chatHistory = new ChatHistory("You are Kostiantyn's helpful AI assistant. Answer queries concisely.");
+
+        string systemMessage = "You are Kostiantyn's helpful AI assistant. Answer queries concisely.";
+        var chatHistory = new ChatHistory(systemMessage);
         chatHistory.AddUserMessage(messageText);
+
         var response = await chatCompletion.GetChatMessageContentAsync(chatHistory);
-        return response.Content ?? "No response generated.";
+
+        string? debugLog = null;
+        if (requestDebugLog)
+        {
+            var sb = new System.Text.StringBuilder();
+            sb.AppendLine("=== SYSTEM PROMPT ===");
+            sb.AppendLine(systemMessage);
+            sb.AppendLine("\n=== CHAT HISTORY ===");
+            foreach (var msg in chatHistory)
+            {
+                sb.AppendLine($"[{msg.Role.ToString().ToUpper()}]:\n{msg.Content}\n");
+            }
+            debugLog = sb.ToString();
+        }
+
+        return (response.Content ?? "No response generated.", debugLog);
     }
 
     private async Task<bool> HandleKnowledgeUploadAsync(ITelegramBotClient botClient, List<Message> groupedMessages, string messageText, int topicId, CancellationToken cancellationToken)
@@ -830,10 +873,10 @@ public class TelegramBotWorker : BackgroundService
         return true;
     }
 
-    private async Task<(string Response, string? RawTranscript)> HandleGoalOrientedFlowAsync(string messageText, int topicId)
+    private async Task<(string Response, string? RawTranscript, string? DebugLog)> HandleGoalOrientedFlowAsync(string messageText, int topicId, bool requestDebugLog)
     {
         var activeContext = _notionCache.CurrentState.GetActiveContextForTopic(topicId, _config);
-        if (activeContext == null) { return ($"Unmapped Topic ID ({topicId}).", null); }
+        if (activeContext == null) { return ($"Unmapped Topic ID ({topicId}).", null, null); }
 
         var routingTriggers = _config.GetSection("AiAgentConfig:RoutingTriggers").Get<string[]>() ?? new[] { "/plan", "/deep" };
         bool requiresDeepReasoning = routingTriggers.Any(t => messageText.StartsWith(t, StringComparison.OrdinalIgnoreCase));
@@ -849,7 +892,7 @@ public class TelegramBotWorker : BackgroundService
             var parts = messageText.Split(new[] { ' ' }, 3, StringSplitOptions.RemoveEmptyEntries);
             if (parts.Length < 3 || !int.TryParse(parts[1], out int projectIndex))
             {
-                return ("⚠️ Invalid format. Use `/project <number> <message>`.", null);
+                return ("⚠️ Invalid format. Use `/project <number> <message>`.", null, null);
             }
 
             string userProjectMessage = parts[2];
@@ -858,7 +901,7 @@ public class TelegramBotWorker : BackgroundService
             var projects = activeContext.Value.Goals.SelectMany(g => g.Projects).ToList();
             if (projectIndex < 1 || projectIndex > projects.Count)
             {
-                return ($"⚠️ Project number {projectIndex} is out of range. Use `/projects` to see the list.", null);
+                return ($"⚠️ Project number {projectIndex} is out of range. Use `/projects` to see the list.", null, null);
             }
 
             var targetProject = projects[projectIndex - 1];
@@ -883,7 +926,7 @@ public class TelegramBotWorker : BackgroundService
         {
             var parts = messageText.Split(new[] { ' ' }, 3, StringSplitOptions.RemoveEmptyEntries);
             if (parts.Length < 2)
-                return ("Please provide a Google Drive link. Example: `/transcript [link] [instructions]`", null);
+                return ("Please provide a Google Drive link. Example: `/transcript [link] [instructions]`", null, null);
 
             string driveLink = parts[1];
             string userInstructions = parts.Length == 3 ? parts[2] : "Please provide a comprehensive summary of this meeting transcript.";
@@ -892,7 +935,7 @@ public class TelegramBotWorker : BackgroundService
 
             string rawTranscript = await DownloadAndTranscribeAudioAsync(driveLink);
 
-            if (rawTranscript.StartsWith("Error")) return (rawTranscript, null);
+            if (rawTranscript.StartsWith("Error")) return (rawTranscript, null, null);
 
             // Save the transcript to our new variable
             capturedTranscript = rawTranscript;
@@ -1005,11 +1048,32 @@ public class TelegramBotWorker : BackgroundService
                 chatHistory.AddAssistantMessage(msg.Content);
             }
         }
-        chatHistory.AddUserMessage(messageText);
+        //chatHistory.AddUserMessage(messageText);
+
+
+        string? debugLog = null;
+        if (requestDebugLog)
+        {
+            var sbLog = new System.Text.StringBuilder();
+            sbLog.AppendLine("=== SYSTEM PROMPT & INSTRUCTIONS ===");
+            sbLog.AppendLine(systemPrompt);
+            sbLog.AppendLine("\n=== CHAT HISTORY (INCLUDING CURRENT PROMPT) ===");
+
+            var conversationOnly = chatHistory.Where(m => !m.Role.ToString().Equals("system", StringComparison.OrdinalIgnoreCase));
+            
+            foreach (var msg in conversationOnly)
+            {
+                sbLog.AppendLine($"[{msg.Role.ToString().ToUpper()}]:\n{msg.Content}\n");
+            }
+            
+            debugLog = sbLog.ToString();
+        }
+        // -------------------------------------------------------
+
         var response = await chatCompletion.GetChatMessageContentAsync(chatHistory, executionSettings, _kernel);
 
-        // Return BOTH the LLM's summary and the captured transcript
-        return (response.Content ?? "No response generated.", capturedTranscript);
+        // Return all three items
+        return (response.Content ?? "No response generated.", capturedTranscript, debugLog);
     }
 
     private async Task<string> DownloadAndTranscribeAudioAsync(string driveLink)

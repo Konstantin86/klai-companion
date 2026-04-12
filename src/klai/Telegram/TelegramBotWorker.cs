@@ -301,6 +301,41 @@ public class TelegramBotWorker : BackgroundService
             return;
         }
 
+
+        if (messageText.Equals("/projects", StringComparison.OrdinalIgnoreCase))
+        {
+            if (topicId == null)
+            {
+                await botClient.SendMessage(message.Chat.Id, "⚠️ Please use this command inside a specific Topic to see its projects.", cancellationToken: cancellationToken);
+                return;
+            }
+
+            var activeContext = _notionCache.CurrentState.GetActiveContextForTopic(topicId.Value, _config);
+            if (activeContext?.Value == null)
+            {
+                await botClient.SendMessage(message.Chat.Id, "⚠️ No active context found for this topic.", messageThreadId: topicId, cancellationToken: cancellationToken);
+                return;
+            }
+
+            // Flatten the active projects dynamically
+            var projects = activeContext.Value.Goals.SelectMany(g => g.Projects).ToList();
+            if (!projects.Any())
+            {
+                await botClient.SendMessage(message.Chat.Id, "📭 No active projects found in this topic.", messageThreadId: topicId, cancellationToken: cancellationToken);
+                return;
+            }
+
+            var sb = new System.Text.StringBuilder("📂 <b>Active Projects:</b>\n\n");
+            for (int i = 0; i < projects.Count; i++)
+            {
+                sb.AppendLine($"<b>{i + 1}</b> - {projects[i].Name}");
+            }
+            sb.AppendLine("\nUse <code>/project &lt;number&gt; &lt;message&gt;</code> to chat with full project context.");
+
+            await botClient.SendMessage(message.Chat.Id, sb.ToString(), messageThreadId: topicId, parseMode: ParseMode.Html, cancellationToken: cancellationToken);
+            return;
+        }
+
         // 1. Check for Knowledge Base Uploads First
         if (topicId != null)
         {
@@ -806,8 +841,43 @@ public class TelegramBotWorker : BackgroundService
         string serviceId = requiresDeepReasoning ? "advanced" : "fast";
         string modelName = _config[$"AiAgentConfig:Models:{(requiresDeepReasoning ? "Advanced" : "Fast")}"]!;
 
-        // --- NEW: Variable to hold the transcript so we can return it at the end
         string? capturedTranscript = null;
+
+        // --- NEW: INTERCEPT /PROJECT COMMAND ---
+        if (messageText.StartsWith("/project ", StringComparison.OrdinalIgnoreCase))
+        {
+            var parts = messageText.Split(new[] { ' ' }, 3, StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Length < 3 || !int.TryParse(parts[1], out int projectIndex))
+            {
+                return ("⚠️ Invalid format. Use `/project <number> <message>`.", null);
+            }
+
+            string userProjectMessage = parts[2];
+
+            // Resolve the numbered project deterministically from the Active Context
+            var projects = activeContext.Value.Goals.SelectMany(g => g.Projects).ToList();
+            if (projectIndex < 1 || projectIndex > projects.Count)
+            {
+                return ($"⚠️ Project number {projectIndex} is out of range. Use `/projects` to see the list.", null);
+            }
+
+            var targetProject = projects[projectIndex - 1];
+
+            // Fetch the deep context directly from the RAM cache
+            string deepProjectContext = _notionCache.CurrentState.GetDeepProjectContext(targetProject.Id);
+
+            // Mutate the message to inject the massive context payload
+            messageText = $@"I have a specific question/task regarding the project '{targetProject.Name}'.
+
+            USER REQUEST: {userProjectMessage}
+
+            {deepProjectContext}";
+
+            // Force 'Advanced' model to handle the heavy token load of all notes/tasks
+            requiresDeepReasoning = true;
+            serviceId = "advanced";
+            modelName = _config["AiAgentConfig:Models:Advanced"]!;
+        }
 
         if (messageText.StartsWith("/transcript", StringComparison.OrdinalIgnoreCase))
         {
@@ -829,15 +899,15 @@ public class TelegramBotWorker : BackgroundService
 
             messageText = $@"I am providing a meeting transcript. Please perform the following task: '{userInstructions}'.
 
-TRANSCRIPT:
-{rawTranscript}";
+            TRANSCRIPT:
+            {rawTranscript}";
 
             requiresDeepReasoning = true;
             serviceId = "advanced";
             modelName = _config["AiAgentConfig:Models:Advanced"]!;
         }
 
-        if (requiresDeepReasoning && !messageText.StartsWith("I am providing a meeting transcript"))
+        if (requiresDeepReasoning && !messageText.StartsWith("I am providing a meeting transcript") && !messageText.StartsWith("I have a specific question/task regarding the project"))
         {
             var triggerWord = routingTriggers.First(t => messageText.StartsWith(t, StringComparison.OrdinalIgnoreCase));
             messageText = messageText.Substring(triggerWord.Length).Trim();

@@ -31,6 +31,62 @@ public class NotionStateCache
         return projectTask;
     }
 
+    // Add this inside the NotionStateCache class
+    public string GetDeepProjectContext(string projectId)
+    {
+        var sb = new System.Text.StringBuilder();
+
+        // 1. Find the raw project from the UNFILTERED Values list
+        var rawProject = Values
+            .SelectMany(v => v.Goals)
+            .SelectMany(g => g.Projects)
+            .FirstOrDefault(p => p.Id == projectId);
+
+        if (rawProject == null) return "Project not found.";
+
+        sb.AppendLine($"=== DEEP CONTEXT FOR PROJECT: {rawProject.Name} ===");
+        sb.AppendLine($"STATUS: {rawProject.Status}");
+        sb.AppendLine($"TIMELINE: {rawProject.Start} to {rawProject.End}");
+        sb.AppendLine();
+        
+        sb.AppendLine("--- ALL TASKS (Including Completed) ---");
+        if (rawProject.Tasks != null && rawProject.Tasks.Any())
+        {
+            // Group by incomplete first, then sort by date
+            foreach (var task in rawProject.Tasks.OrderBy(t => t.IsCompleted).ThenBy(t => t.Date))
+            {
+                string status = task.IsCompleted ? "[x]" : "[ ]";
+                string date = task.Date.HasValue ? $"({task.Date.Value:yyyy-MM-dd})" : "(No Date)";
+                sb.AppendLine($"{status} {task.Name} {date}");
+            }
+        }
+        else
+        {
+            sb.AppendLine("No tasks found.");
+        }
+        sb.AppendLine();
+
+        sb.AppendLine("--- LINKED NOTES & ARTIFACTS ---");
+        // Search the global Notes list for any note referencing this Project ID
+        var linkedNotes = Notes.Where(n => n.ProjectIds != null && n.ProjectIds.Contains(projectId)).ToList();
+        
+        if (linkedNotes.Any())
+        {
+            foreach (var note in linkedNotes)
+            {
+                sb.AppendLine($"📄 NOTE: {note.Name} (Type: {note.Type})");
+                sb.AppendLine($"CONTENT:\n{note.Content}");
+                sb.AppendLine("-----------------------------------");
+            }
+        }
+        else
+        {
+            sb.AppendLine("No linked notes found.");
+        }
+
+        return sb.ToString();
+    }
+
     public NotionActiveContext? GetActiveContextForTopic(int topicId, IConfiguration config)
     {
         // 1. Map the Telegram Topic ID to the Notion Value Name
@@ -50,9 +106,12 @@ public class NotionStateCache
             SystemPrompt = fullValue.SystemPrompt 
         };
 
+        // NEW: Define the narrow +/- 3 days context window
+        var threeDaysAgo = DateTime.UtcNow.AddDays(-3);
+        var threeDaysFromNow = DateTime.UtcNow.AddDays(3);
         var oneWeekAgo = DateTime.UtcNow.AddDays(-7);
 
-        // 4. The Smart Filter: Only keep active goals, active projects, and recent/open tasks
+        // 4. The Smart Filter: Only keep active goals, active projects, and recent/upcoming tasks
         foreach (var goal in fullValue.Goals.Where(g => g.Status != "Done" && g.Status != "Archived"))
         {
             var leanGoal = new NotionGoal 
@@ -75,10 +134,11 @@ public class NotionStateCache
                     End = project.End 
                 };
 
-                // Filter Tasks: Only open tasks, or tasks completed in the last 7 days
+                // Filter Tasks: Keep tasks strictly within the 3-day window (past or future).
+                // Keep open tasks with NO date (backlog), but hide completed undated tasks.
                 leanProject.Tasks = project.Tasks.Where(t => 
-                    !t.IsCompleted || 
-                    (t.IsCompleted && t.Date >= oneWeekAgo)
+                    (t.Date.HasValue && t.Date.Value >= threeDaysAgo && t.Date.Value <= threeDaysFromNow) ||
+                    (!t.Date.HasValue && !t.IsCompleted)
                 ).ToList();
 
                 leanGoal.Projects.Add(leanProject);
@@ -94,8 +154,10 @@ public class NotionStateCache
                     (t.Date.HasValue &&
                     (!t.IsCompleted || 
                     (t.IsCompleted && t.Date >= oneWeekAgo)))
-                ).ToList()
+            ).ToList()
         };
+
+        
 
         return notionActiveContext;
     }

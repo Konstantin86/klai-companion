@@ -54,36 +54,46 @@ class Program
         var sttModel = builder.Configuration["AiAgentConfig:Models:SpeechToText"] ?? "whisper";
         var ttsModel = builder.Configuration["AiAgentConfig:Models:TextToSpeech"] ?? "tts";
 
+        var skHttpClient = new HttpClient 
+        { 
+            Timeout = TimeSpan.FromMinutes(5) 
+        };
+
         builder.Services.AddKernel()
                     .AddAzureOpenAIChatCompletion(
                         deploymentName: fastModel,
                         endpoint: endpoint,
                         apiKey: apiKey,
-                        serviceId: "fast"
+                        serviceId: "fast",
+                        httpClient: skHttpClient
                     )
                     .AddAzureOpenAIChatCompletion(
                         deploymentName: advancedModel,
                         endpoint: endpoint,
                         apiKey: apiKey,
-                        serviceId: "advanced"
+                        serviceId: "advanced",
+                        httpClient: skHttpClient
                     )
                     .AddAzureOpenAITextEmbeddingGeneration(
                         deploymentName: embeddingModel,
                         endpoint: endpoint,
                         apiKey: apiKey,
                         serviceId: "embedding",
-                        dimensions: 3072
+                        dimensions: 3072,
+                        httpClient: skHttpClient
                     ).
                     AddAzureOpenAIAudioToText(
                         deploymentName: sttModel,
                         endpoint: endpoint,
                         apiKey: apiKey,
-                        serviceId: "audio-to-text"
+                        serviceId: "audio-to-text",
+                        httpClient: skHttpClient
                     ).AddAzureOpenAITextToAudio(
                         deploymentName: ttsModel,
                         endpoint: openAITTSEndpoint,
                         apiKey: openAITTSApiKey,
-                        serviceId: "text-to-audio"
+                        serviceId: "text-to-audio",
+                        httpClient: skHttpClient
                     )
                     .Plugins.AddFromType<TimePlugin>("Time")
                     .AddFromType<LongTermMemoryPlugin>("LongTermMemory")

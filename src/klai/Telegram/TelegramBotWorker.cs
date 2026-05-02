@@ -1048,7 +1048,7 @@ public class TelegramBotWorker : BackgroundService
                 chatHistory.AddAssistantMessage(msg.Content);
             }
         }
-        //chatHistory.AddUserMessage(messageText);
+        chatHistory.AddUserMessage(messageText);
 
 
         string? debugLog = null;
